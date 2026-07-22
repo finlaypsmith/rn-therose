@@ -3,13 +3,26 @@
 import os,re,sys,time,requests
 from seleniumbase import SB
 
-# 环境变量 
-EMAIL = os.environ.get("EMAIL") or ""            # 邮箱   
+# 环境变量
+EMAIL = os.environ.get("EMAIL") or ""            # 邮箱
 PASSWORD = os.environ.get("PASSWORD") or ""      # 密码
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""  # tg通知 bot token
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""      # tg通知 chat_id id
 
+# 代理配置（由 setup_proxy.sh 写入 GITHUB_ENV）
+IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
+
 BASE_URL = "https://client.therose.cloud/login"
+
+# 获取当前出口ip（用于确认代理是否生效）
+def get_current_ip(proxy_server: str = "") -> str:
+    proxies = None
+    if proxy_server:
+        proxies = {"http": proxy_server, "https": proxy_server}
+    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    response.raise_for_status()
+    return response.text.strip()
 
 # 检查必要变量
 if not EMAIL or not PASSWORD:
@@ -131,7 +144,21 @@ def login(sb, email, password):
 def main():
     print("🚀 启动浏览器")
 
-    with SB(uc=True, headless=False) as sb:
+    sb_kwargs = {"uc": True, "headless": False}
+
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        sb_kwargs["proxy"] = PROXY_SERVER
+    else:
+        print("🍭 未使用代理，直连访问")
+
+    with SB(**sb_kwargs) as sb:
+        try:
+            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            print(f"📍 当前出口IP: {ip}")
+        except Exception as e:
+            print(f"⚠️ 获取出口 IP 失败: {e}")
+
         success, url = login(sb, EMAIL, PASSWORD)
         
         if not success:
