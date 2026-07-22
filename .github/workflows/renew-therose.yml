@@ -1,0 +1,96 @@
+name: Auto Renew The Rose Cloud
+
+on:
+  workflow_dispatch:
+
+jobs:
+  renew-therose:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install system and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          python -m pip install --upgrade pip
+          python -m pip install seleniumbase requests
+          seleniumbase install chromedriver
+
+      - name: Configure sing-box proxy
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          wget -qO /tmp/setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh
+          bash /tmp/setup_proxy.sh
+
+      - name: Run renewal script
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          xvfb-run --auto-servernum python3 renew_therose.py
+
+      - name: Clean up processes and temporary files
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log /tmp/setup_proxy.sh
+
+      - name: Keep the 10 latest workflow runs
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -o pipefail
+
+          current_run=$(gh api "/repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" \
+            --jq '[.workflow_id, .created_at] | @tsv')
+          IFS=$'\t' read -r workflow_id current_created_at <<< "$current_run"
+
+          tmp_dir=$(mktemp -d)
+          trap 'rm -rf "$tmp_dir"' EXIT
+          runs_file="$tmp_dir/runs.tsv"
+          ordered_runs_file="$tmp_dir/ordered-runs.tsv"
+
+          gh api --paginate \
+            "/repos/$GH_REPO/actions/workflows/$workflow_id/runs?per_page=100" \
+            --jq '.workflow_runs[] | [.created_at, (.id | tostring)] | @tsv' \
+            > "$runs_file"
+
+          {
+            printf '%s\t%s\n' "$current_created_at" "$GITHUB_RUN_ID"
+            sort -t $'\t' -k1,1r -k2,2nr "$runs_file" |
+              awk -F '\t' -v current="$GITHUB_RUN_ID" \
+                '$2 != current && !seen[$2]++'
+          } > "$ordered_runs_file"
+
+          count=0
+          while IFS=$'\t' read -r created_at run_id; do
+            count=$((count + 1))
+            echo "Workflow run: created_at=$created_at id=$run_id"
+            if [ "$count" -le 10 ]; then
+              echo "Keeping workflow run: $run_id"
+            else
+              echo "Deleting old workflow run: $run_id"
+              gh run delete "$run_id" --repo "$GH_REPO" || true
+            fi
+          done < "$ordered_runs_file"
