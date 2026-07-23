@@ -134,5 +134,186 @@ async function launchRealBrowser() {
     return { browser, page };
 }
 
+// 读取 Turnstile token：先 window.turnstile.getResponse()，再隐藏字段兜底（与 g4 getTurnstileToken 等价）
+async function getTurnstileToken(page) {
+    try {
+        return await page.evaluate(() => {
+            try {
+                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                    const r = window.turnstile.getResponse();
+                    if (r && r.length > 20) return r;
+                }
+            } catch (e) {}
+            const el = document.querySelector('[name="cf-turnstile-response"]');
+            return el && el.value && el.value.length > 20 ? el.value : '';
+        });
+    } catch (e) {
+        return '';
+    }
+}
+
+// 轮询等 Turnstile 被 puppeteer-real-browser 自动求解：唯一权威信号 = token 非空
+async function waitTurnstileToken(page, timeoutS = 60) {
+    log('📡 等待 puppeteer-real-browser 自动求解 Turnstile...');
+    for (let i = 0; i < timeoutS; i++) {
+        const token = await getTurnstileToken(page);
+        if (token) {
+            log(`✅ Turnstile token 已就绪（长度 ${token.length}）`);
+            return true;
+        }
+        if (i === 20) log('⏳ Turnstile 仍在求解中（可能出现 interactive checkbox，自动求解器处理中）...');
+        await sleep(1500);
+    }
+    return false;
+}
+
+// 关 cookie 同意弹窗（沿用 g4 evaluate 写法，消除遮挡）
+async function dismissCookieConsent(page) {
+    try {
+        await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button, span, a'));
+            const b = btns.find((el) => {
+                const t = (el.textContent || '').trim().toLowerCase();
+                return t === 'consent' || t === 'accept' || t === 'i agree' || t.includes('recommended cookies');
+            });
+            if (b) b.click();
+        });
+    } catch (e) { /* 忽略 */ }
+}
+
+// 填邮箱/密码，填后校验真写入、非 placeholder，异常重填 —— 对齐旧 Python 版 fill+校验逻辑
+async function fillCredentials(page) {
+    log('📧 填写邮箱...');
+    // 先清空再填，避免残留
+    await page.click('#login_form_email', { clickCount: 3 }).catch(() => {});
+    await page.type('#login_form_email', EMAIL, { delay: 30 });
+    log('🔑 填写密码...');
+    await page.click('#login_form_password', { clickCount: 3 }).catch(() => {});
+    await page.type('#login_form_password', PASSWORD, { delay: 30 });
+    await sleep(400);
+    const v = await page.evaluate(() => {
+        const e = document.querySelector('#login_form_email');
+        return e ? e.value || '' : '';
+    });
+    if (v && !v.includes(EMAIL.slice(0, 3)) && v !== EMAIL) {
+        log(`⚠️ 邮箱字段异常（值前缀 ${v.slice(0, 6)}），重填`);
+        await page.click('#login_form_email', { clickCount: 3 });
+        await page.type('#login_form_email', EMAIL, { delay: 30 });
+        await page.click('#login_form_password', { clickCount: 3 });
+        await page.type('#login_form_password', PASSWORD, { delay: 30 });
+    }
+}
+
+// 为 fail-closed 诊断采集登录页 DOM 状态
+async function diagnosePage(page) {
+    try {
+        return await page.evaluate(() => {
+            const errSel = ['.alert-danger', '.alert.alert-danger', 'div[role="alert"]', '.invalid-feedback', '.form-error', '.error-message', 'div.alert'];
+            let errText = '';
+            for (const s of errSel) {
+                const el = document.querySelector(s);
+                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
+                    errText = (el.textContent || '').trim();
+                    if (errText) break;
+                }
+            }
+            const tEl = document.querySelector('[name="cf-turnstile-response"]');
+            const cf = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile');
+            return {
+                url: location.href,
+                title: document.title,
+                hasCfIframe: !!cf,
+                tokenLen: tEl && tEl.value ? tEl.value.length : 0,
+                errText: errText.slice(0, 300),
+            };
+        });
+    } catch (e) {
+        return { diagError: e.message };
+    }
+}
+
+// 登录流程：过盾 → fail-closed → 点 Sign in → 等跳 /panel|/dashboard
+async function login(page) {
+    log('🌐 打开登录页面...');
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await humanWait(2, 4);
+    // 若被 CF 拦到 challenge 中间页，puppeteer-real-browser 会自动求解；给一点缓冲
+    await dismissCookieConsent(page);
+
+    let tokenOk = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        // 每轮先确保凭证在（Turnstile 重新触发可能清表单）
+        await fillCredentials(page);
+
+        // puppeteer-real-browser turnstile:true 在后台自动求解，我们只等 token
+        if (await waitTurnstileToken(page, 60)) {
+            tokenOk = true;
+            break;
+        }
+        log(`⏳ 第 ${attempt} 次未拿到 token，重试...`);
+        // 触发重新渲染 Turnstile：整页重开
+        if (attempt < 3) {
+            await page.evaluate(() => { try { window.location.reload(); } catch (e) {} });
+            await humanWait(4, 7);
+            await dismissCookieConsent(page);
+        }
+    }
+
+    if (!tokenOk) {
+        const diag = await diagnosePage(page);
+        log(`🩺 登录诊断: ${JSON.stringify(diag)}`);
+        try { await page.screenshot({ path: 'artifacts/turnstile_fail.png' }); } catch (e) {}
+        throw new Error('Cloudflare Turnstile 验证未通过：未拿到有效 token，已终止（不点 Sign in）。');
+    }
+
+    log('🖱️ 点击 Sign in...');
+    try {
+        await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const b = btns.find((el) => (el.textContent || '').trim().toLowerCase() === 'sign in');
+            if (b) b.click();
+            else throw new Error('未找到 Sign in 按钮');
+        });
+    } catch (e) {
+        // JS click 兜底
+        await page.evaluate(() => {
+            const b = document.querySelector('button');
+            if (b) b.click();
+        });
+    }
+    await humanWait(4, 7);
+
+    // 提交后若又冒 Turnstile，再等一次 token
+    const tokenAfter = await getTurnstileToken(page);
+    if (!tokenAfter) {
+        const cfStill = await page.evaluate(() => !!(document.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')));
+        if (cfStill) {
+            log('🛡 提交后再冒 Turnstile，继续等 token...');
+            await waitTurnstileToken(page, 25);
+            await sleep(1500);
+        }
+    }
+
+    for (let i = 0; i < 30; i++) {
+        const url = page.url();
+        if (url.includes('/panel') || url.includes('/dashboard')) {
+            log(`✅ 登录成功，已跳转: ${url}`);
+            return url;
+        }
+        if (i > 0 && i % 5 === 0) {
+            const diag = await diagnosePage(page);
+            if (diag.errText && /invalid|incorrect|wrong|错误|失败/i.test(diag.errText)) {
+                log(`❌ 检测到登录错误: ${diag.errText}`);
+                try { await page.screenshot({ path: 'artifacts/login_error.png' }); } catch (e) {}
+                throw new Error(`登录被拒: ${diag.errText || '未知错误'} | ${url}`);
+            }
+        }
+        await sleep(1000);
+    }
+    const diag = await diagnosePage(page);
+    try { await page.screenshot({ path: 'artifacts/login_timeout.png' }); } catch (e) {}
+    throw new Error(`登录超时未跳转 Dashboard | ${diag.url || ''} | ${diag.errText || ''}`);
+}
+
 // 纯逻辑导出，供 tests/ 断言
 module.exports = { maskEmail, timeToSeconds };
