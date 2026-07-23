@@ -378,3 +378,63 @@ async function renew(page) {
 
 // 纯逻辑导出，供 tests/ 断言
 module.exports = { maskEmail, timeToSeconds };
+
+async function main() {
+    if (!EMAIL || !PASSWORD) {
+        log('❌ 请设置环境变量 EMAIL 和 PASSWORD');
+        process.exit(1);
+    }
+    try { require('fs').mkdirSync('artifacts', { recursive: true }); } catch (e) {}
+
+    let browser, page;
+    try {
+        ({ browser, page } = await launchRealBrowser());
+    } catch (e) {
+        log(`❌ ${e.message}`);
+        await sendTelegram(formatNotification('❌ 登录失败', '', e.message));
+        return;
+    }
+
+    let egressIp = '';
+    try {
+        if (IS_PROXY) log(`🔗 挂载代理: ${PROXY_SERVER}`);
+        else log('🍭 未使用代理，直连访问');
+        await page.goto('https://api.ip.sb/ip', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        egressIp = await page.evaluate(() => (document.body.innerText || '').trim()).catch(() => '');
+        log(`📍 当前出口IP: ${maskIp(egressIp)}`);
+    } catch (e) {
+        log(`⚠️ 获取出口 IP 失败: ${e.message}`);
+        // 代理异常提前暴露，但不直接终止：继续尝试登录，让 Turnstile 失败做最终判定
+    }
+
+    try {
+        await login(page);
+    } catch (e) {
+        log(`❌ 登录失败: ${e.message}`);
+        const extra = egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : '';
+        await sendTelegram(formatNotification('❌ 登录失败', extra, e.message));
+        try { await browser.close(); } catch (x) {}
+        return;
+    }
+
+    try {
+        const r = await renew(page);
+        const extra = [r.text, egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : ''].filter(Boolean).join(' | ');
+        if (r.ok) {
+            await sendTelegram(formatNotification('✅ 续期成功', extra));
+        } else {
+            await sendTelegram(formatNotification('❌ 续期可能失败', extra, r.text));
+        }
+    } catch (e) {
+        log(`❌ 续期异常: ${e.message}`);
+        try { await page.screenshot({ path: 'artifacts/renew_error.png' }); } catch (x) {}
+        await sendTelegram(formatNotification('❌ 续期异常', '', e.message));
+    } finally {
+        try { await browser.close(); } catch (e) {}
+    }
+    log('🏁 脚本执行完毕');
+}
+
+if (require.main === module) {
+    main();
+}
