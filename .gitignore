@@ -4,3 +4,5 @@
 /__pycache__/
 *.png
 .pytest_cache/
+/node_modules/
+/artifacts/
