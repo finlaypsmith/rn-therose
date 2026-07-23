@@ -507,8 +507,6 @@ async function renew(page) {
     return { ok: false, text: result.text };
 }
 
-// 纯逻辑导出，供 tests/ 断言
-module.exports = { maskEmail, timeToSeconds };
 
 async function main() {
     if (!EMAIL || !PASSWORD) {
