@@ -63,10 +63,10 @@ def check_renewal_success(sb):
         'span:contains("successfully purchased")',
         'div:contains("successfully purchased")'
     ]
-    
+
     print("⏳ 等待5秒检查续期结果...")
     time.sleep(5)
-    
+
     for selector in success_selectors:
         try:
             element = sb.find_element(selector, timeout=2)
@@ -77,8 +77,7 @@ def check_renewal_success(sb):
                 return True, text
         except:
             continue
-    
-    # 如果没有找到特定选择器，检查页面源码是否包含成功关键词
+
     try:
         page_source = sb.get_page_source()
         if "successfully purchased" in page_source.lower():
@@ -86,7 +85,7 @@ def check_renewal_success(sb):
             return True, "服务器已成功续期"
     except:
         pass
-    
+
     return False, "未检测到续期成功提示"
 
 # 掩码邮箱（只用于通知展示，脱敏）
@@ -129,42 +128,183 @@ def send_tg(token, chat_id, message):
     except Exception as e:
         print(f"❌ Telegram 发送异常: {e}")
 
+# 等待 Turnstile 验证通过（只认真实 token，避免文案误判）
+def wait_for_turnstile_pass(sb, timeout=30):
+    pending_markers = [
+        "verify you are human",
+        "确认您是真人",
+        "just a moment",
+        "checking your browser",
+        "正在验证",
+        "验证中",
+        "stuck?",
+        "卡住",
+    ]
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            token = sb.execute_script(
+                "var el=document.querySelector("
+                "'[name=\"cf-turnstile-response\"], textarea[name=\"cf-turnstile-response\"], "
+                "input[name=\"cf-turnstile-response\"]');"
+                "return el ? (el.value || '') : '';"
+            )
+            if token and len(token) > 20:
+                print("✅ Turnstile token 已就绪")
+                return True
+        except Exception:
+            pass
+        try:
+            page_lower = sb.get_page_source().lower()
+            if any(x in page_lower for x in pending_markers):
+                # 仍在验证中，继续等
+                sb.sleep(1)
+                continue
+        except Exception:
+            pass
+        sb.sleep(1)
+    print("❌ Turnstile 验证超时未通过（未拿到 token）")
+    return False
+
+# 采集登录页错误信息
+def extract_login_error(sb) -> str:
+    selectors = [
+        ".alert-danger",
+        ".alert.alert-danger",
+        "div[role='alert']",
+        ".invalid-feedback",
+        ".form-error",
+        ".error-message",
+        "div.alert",
+    ]
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                text = (sb.get_text(sel) or "").strip()
+                if text:
+                    return text[:300]
+        except Exception:
+            continue
+    try:
+        body = (sb.get_text("body") or "")[:500]
+        for kw in ["invalid", "incorrect", "failed", "error", "wrong", "captcha", "验证", "错误", "失败"]:
+            if kw in body.lower():
+                return body.replace("\n", " ").strip()[:200]
+    except Exception:
+        pass
+    return ""
+
 # 登录流程
 def login(sb, email, password):
     print("🌐 打开登录页面...")
-    print("⏳ 等待页面加载...")
-    sb.open(BASE_URL)
+    # UC 模式：打开后短暂断开 chromedriver，降低 CF 检测
+    sb.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
     sb.wait_for_ready_state_complete()
-    sb.sleep(1)
-    print("📧 填写邮箱...")
-    sb.type('#login_form_email', email, timeout=10)
-    print("🔑 填写密码...")
-    sb.type('#login_form_password', password, timeout=10)
-    time.sleep(1) 
+    sb.sleep(2)
+
+    def fill_credentials():
+        print("📧 填写邮箱...")
+        sb.type("#login_form_email", email, timeout=10)
+        print("🔑 填写密码...")
+        sb.type("#login_form_password", password, timeout=10)
+        sb.sleep(0.5)
+        # 确认已写入（非 placeholder）
+        try:
+            v = sb.get_value("#login_form_email") or ""
+            if email not in v and v != email:
+                print(f"⚠️ 邮箱字段异常: {v!r}，重试填写")
+                sb.clear("#login_form_email")
+                sb.type("#login_form_email", email, timeout=10)
+                sb.clear("#login_form_password")
+                sb.type("#login_form_password", password, timeout=10)
+        except Exception as e:
+            print(f"⚠️ 校验表单字段失败: {e}")
+
+    fill_credentials()
+
+    # 处理 Turnstile：最多重试 3 次，通过后再点登录
     print("🛡 处理 Turnstile...")
+    turnstile_passed = False
+    for attempt in range(1, 4):
+        # 每次尝试前确保凭证仍在
+        try:
+            v = sb.get_value("#login_form_email") or ""
+            if not v or email not in v:
+                fill_credentials()
+        except Exception:
+            fill_credentials()
+
+        try:
+            sb.uc_gui_click_captcha(retry=True, blind=True)
+            print(f"✅ 第 {attempt} 次点击 Turnstile")
+            sb.sleep(5)
+        except Exception as e:
+            print(f"⚠️ uc_gui_click_captcha 异常 (第{attempt}次): {e}")
+
+        if wait_for_turnstile_pass(sb, timeout=25):
+            turnstile_passed = True
+            break
+        print(f"⏳ 第 {attempt} 次未通过，重试...")
+        sb.sleep(2)
+
+    if not turnstile_passed:
+        err = extract_login_error(sb) or "Turnstile 验证未通过"
+        print(f"❌ {err}")
+        sb.save_screenshot("login_failed.png")
+        return False, f"{sb.get_current_url()} | {err}"
+
+    # 点击前再确认凭证
     try:
-        sb.uc_gui_click_captcha()
-        print("✅ Turnstile 验证已处理")
-        # sb.save_screenshot("turnstile_passed.png")
-    except Exception as e:
-        print(f"⚠️ uc_gui_click_captcha 执行异常: {e}")
+        v = sb.get_value("#login_form_email") or ""
+        if not v or email not in v:
+            fill_credentials()
+    except Exception:
+        fill_credentials()
+
     print("🔑 点击登录按钮...")
-    sb.uc_click('button:contains("Sign in")')
-    sb.sleep(3)
-    for _ in range(30):
-        # 判断是否登录成功
+    try:
+        sb.uc_click('button:contains("Sign in")')
+    except Exception as e:
+        print(f"⚠️ uc_click 失败，尝试 JS 点击: {e}")
+        try:
+            btn = sb.find_element('button:contains("Sign in")', timeout=5)
+            sb.driver.execute_script("arguments[0].click();", btn)
+        except Exception as e2:
+            sb.save_screenshot("login_failed.png")
+            return False, f"点击 Sign in 失败: {e2}"
+
+    sb.sleep(4)
+
+    # 提交后若再次出现验证码，再点一次
+    try:
+        page_lower = sb.get_page_source().lower()
+        if any(x in page_lower for x in ["正在验证", "verify you are human", "cf-turnstile"]):
+            print("🛡 登录后再次出现 Turnstile，继续处理...")
+            sb.uc_gui_click_captcha(retry=True, blind=True)
+            wait_for_turnstile_pass(sb, timeout=20)
+            sb.sleep(2)
+    except Exception:
+        pass
+
+    for i in range(30):
         current_url = sb.get_current_url()
         page_title = sb.get_title() or ""
-        print(f"📄 当前 URL: {current_url} | Title: {page_title}")
-        if "panel" in current_url:
+        print(f"📄 [{i+1}/30] URL: {current_url} | Title: {page_title}")
+        if "panel" in current_url or "/dashboard" in current_url:
             print("✅ 登录成功，已跳转到 Dashboard")
-            # sb.save_screenshot("login_success.png")
             return True, current_url
+        if i >= 3 and i % 5 == 0:
+            err = extract_login_error(sb)
+            if err and any(k in err.lower() for k in ["invalid", "incorrect", "wrong", "错误", "失败"]):
+                print(f"❌ 检测到登录错误: {err}")
+                sb.save_screenshot("login_failed.png")
+                return False, f"{current_url} | {err}"
         time.sleep(1)
 
-    print(f"❌ 登录失败，当前 URL: {sb.get_current_url()}")
-    sb.save_screenshot("login_faild.png")
-    return False, sb.get_current_url()
+    err = extract_login_error(sb) or "超时未跳转 Dashboard"
+    print(f"❌ 登录失败: {err} | URL: {sb.get_current_url()}")
+    sb.save_screenshot("login_failed.png")
+    return False, f"{sb.get_current_url()} | {err}"
 
 # 主流程
 def main():
@@ -187,26 +327,24 @@ def main():
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
         success, url = login(sb, EMAIL, PASSWORD)
-        
+
         if not success:
-            msg = format_notification("❌ 登录失败", error=f"未跳转到 Dashboard，当前 URL: {url}")
+            msg = format_notification("❌ 登录失败", error=str(url))
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
 
         print("📄 开始续期流程...")
-        
-        # 点击 Extend 按钮
+
         ok, info = click_extend_button(sb)
         if not ok:
             msg = format_notification("❌ 续期失败", error=f"点击 Extend 按钮失败: {info.get('error')}")
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
-        
+
         time.sleep(1)
-        
-        # 点击 Order now 按钮
+
         try:
             button = sb.find_element('button:contains("Order now")', timeout=5)
             if button:
@@ -223,12 +361,10 @@ def main():
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
-        
-        # 检查续期是否成功
+
         print("🔍 检查续期结果...")
         renewal_success, renewal_msg = check_renewal_success(sb)
 
-        # 附加出口IP信息，便于排查代理是否生效
         ip_extra = f"🌐 出口IP: {ip}" if ip else ""
 
         if renewal_success:

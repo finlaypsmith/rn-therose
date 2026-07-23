@@ -1,2 +1,6 @@
 /.tmp/
 /docs/superpowers/
+/downloaded_files/
+/__pycache__/
+*.png
+.pytest_cache/
