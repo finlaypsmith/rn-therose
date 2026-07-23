@@ -20,6 +20,8 @@
  *   TG_CHAT_ID       Telegram chat id
  */
 
+const { connect } = require('puppeteer-real-browser');
+
 const EMAIL = process.env.EMAIL || '';
 const PASSWORD = process.env.PASSWORD || '';
 const IS_PROXY = (process.env.IS_PROXY || 'false').toLowerCase() === 'true';
@@ -102,6 +104,34 @@ function formatNotification(status, extra = '', error = '') {
     if (error) lines.push(`⚠️ 错误信息: ${error}`);
     lines.push(`⏱️ 执行时间: ${nowBeijing()}`);
     return lines.join('\n');
+}
+
+// 启动过盾浏览器（puppeteer-real-browser + turnstile:true），按 IS_PROXY 挂 socks5 代理
+async function launchRealBrowser() {
+    const args = [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--window-size=1280,1200',
+    ];
+    if (IS_PROXY) args.push(`--proxy-server=${PROXY_SERVER}`);
+
+    log('🚀 启动浏览器（puppeteer-real-browser / turnstile）');
+    let browser, page;
+    try {
+        ({ browser, page } = await connect({
+            headless: false,
+            turnstile: true,             // 自动求解 Cloudflare Turnstile（替代旧版 uc_gui_click_captcha）
+            disableXvfb: true,            // 外层 workflow 已用 xvfb-run，避免嵌套 X server 冲突
+            connectOption: { defaultViewport: null, executablePath: '/usr/bin/google-chrome' },
+            args,
+        }));
+    } catch (e) {
+        throw new Error(`浏览器启动失败: ${e.message}`);
+    }
+    await page.setViewport({ width: 1280, height: 1200 });
+    return { browser, page };
 }
 
 // 纯逻辑导出，供 tests/ 断言
