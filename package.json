@@ -1,0 +1,14 @@
+{
+  "name": "rn-therose-renew",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The Rose Cloud 自动续期（puppeteer-real-browser 过 Cloudflare Turnstile）",
+  "main": "renew_therose.js",
+  "scripts": {
+    "start": "node renew_therose.js",
+    "test": "node tests/logic.test.js"
+  },
+  "dependencies": {
+    "puppeteer-real-browser": "^1.4.4"
+  }
+}
