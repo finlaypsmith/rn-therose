@@ -48,5 +48,61 @@ function timeToSeconds(t) {
     return +m[1] * 3600 + +m[2] * 60 + +m[3];
 }
 
+function log(msg) {
+    const t = new Date().toTimeString().slice(0, 8);
+    console.log(`[${t}] [INFO] ${msg}`);
+}
+
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+function humanWait(minS = 2, maxS = 4) {
+    return sleep((minS + Math.random() * (maxS - minS)) * 1000);
+}
+
+// 当前 GMT+8 时间字符串，与旧 Python 版 format_notification 的执行时间一致
+function nowBeijing() {
+    const d = new Date();
+    const beijing = new Date(d.getTime() + 8 * 3600 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${beijing.getUTCFullYear()}-${pad(beijing.getUTCMonth() + 1)}-${pad(beijing.getUTCDate())} ${pad(beijing.getUTCHours())}:${pad(beijing.getUTCMinutes())}:${pad(beijing.getUTCSeconds())}`;
+}
+
+// 掩码出口 IP：只打点分首尾段，如 1.2.***.4
+function maskIp(ip) {
+    const p = String(ip || '').split('.');
+    if (p.length === 4) return `${p[0]}.${p[1]}.***.${p[3]}`;
+    return '未知';
+}
+
+// 发送 Telegram 通知（与旧 Python 版 send_tg 等价）
+async function sendTelegram(message) {
+    if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
+        log('⚠️ 未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过推送。');
+        return;
+    }
+    try {
+        const res = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message }),
+        });
+        if (res.ok) log('✅ TG 推送已发送');
+        else log(`❌ TG 推送失败: HTTP ${res.status}`);
+    } catch (e) {
+        log(`❌ TG 推送异常: ${e.message}`);
+    }
+}
+
+// 与旧 Python 版 format_notification 逐行一致的通知文案
+function formatNotification(status, extra = '', error = '') {
+    const lines = ['🌹 The Rose Cloud 续期通知', '', status, `👤 登录账户: ${maskEmail(EMAIL)}`];
+    if (extra) lines.push(extra);
+    if (error) lines.push(`⚠️ 错误信息: ${error}`);
+    lines.push(`⏱️ 执行时间: ${nowBeijing()}`);
+    return lines.join('\n');
+}
+
 // 纯逻辑导出，供 tests/ 断言
 module.exports = { maskEmail, timeToSeconds };
