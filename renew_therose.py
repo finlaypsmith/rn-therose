@@ -89,6 +89,32 @@ def check_renewal_success(sb):
     
     return False, "未检测到续期成功提示"
 
+# 掩码邮箱（只用于通知展示，脱敏）
+def mask_email(email: str) -> str:
+    if '@' in email:
+        name, domain = email.split('@', 1)
+        if len(name) > 4:
+            return f"{name[:2]}****{name[-2:]}@{domain}"
+        return f"{name}@{domain}"
+    return email[:2] + '****' if email else "（未配置）"
+
+# 通知格式
+def format_notification(status: str, extra: str = "", error: str = "") -> str:
+    local_time = time.gmtime(time.time() + 8 * 3600)
+    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+    lines = [
+        "🌹 The Rose Cloud 续期通知",
+        "",
+        f"{status}",
+        f"👤 登录账户: {mask_email(EMAIL)}",
+    ]
+    if extra:
+        lines.append(extra)
+    if error:
+        lines.append(f"⚠️ 错误信息: {error}")
+    lines.append(f"⏱️ 执行时间: {now}")
+    return "\n".join(lines)
+
 # 发送tg通知
 def send_tg(token, chat_id, message):
     if not token or not chat_id:
@@ -153,6 +179,7 @@ def main():
         print("🍭 未使用代理，直连访问")
 
     with SB(**sb_kwargs) as sb:
+        ip = ""
         try:
             ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
             print(f"📍 当前出口IP: {ip}")
@@ -162,7 +189,7 @@ def main():
         success, url = login(sb, EMAIL, PASSWORD)
         
         if not success:
-            msg = f"❌ 登录失败"
+            msg = format_notification("❌ 登录失败", error=f"未跳转到 Dashboard，当前 URL: {url}")
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
@@ -172,7 +199,7 @@ def main():
         # 点击 Extend 按钮
         ok, info = click_extend_button(sb)
         if not ok:
-            msg = f"❌ 点击 Extend 按钮失败: {info.get('error')}"
+            msg = format_notification("❌ 续期失败", error=f"点击 Extend 按钮失败: {info.get('error')}")
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
@@ -187,12 +214,12 @@ def main():
                 sb.uc_click('button:contains("Order now")')
                 print("✅ 已点击 Order now 按钮")
             else:
-                msg = "❌ 未找到 Order now 按钮"
+                msg = format_notification("❌ 续期失败", error="未找到 Order now 按钮")
                 print(msg)
                 send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
                 return
         except Exception as e:
-            msg = f"❌ 点击 Order now 失败: {e}"
+            msg = format_notification("❌ 续期失败", error=f"点击 Order now 失败: {e}")
             print(msg)
             send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
             return
@@ -200,16 +227,27 @@ def main():
         # 检查续期是否成功
         print("🔍 检查续期结果...")
         renewal_success, renewal_msg = check_renewal_success(sb)
-        
+
+        # 附加出口IP信息，便于排查代理是否生效
+        ip_extra = f"🌐 出口IP: {ip}" if ip else ""
+
         if renewal_success:
-            msg = f"✅ 续期成功！{renewal_msg}"
-            print(msg)
+            status = "✅ 续期成功"
+            extra = renewal_msg
+            print(f"✅ 续期成功！{renewal_msg}")
             sb.save_screenshot("renewal_success.png")
         else:
-            msg = f"❌ 续期可能失败: {renewal_msg}"
-            print(msg)
+            status = "❌ 续期可能失败"
+            extra = "请登录后台检查"
+            print(f"❌ 续期可能失败: {renewal_msg}")
             sb.save_screenshot("renewal_failed.png")
-        
+
+        msg = format_notification(
+            status,
+            extra=" | ".join(filter(None, [extra, ip_extra])),
+            error="" if renewal_success else renewal_msg,
+        )
+        print(msg)
         send_tg(TG_BOT_TOKEN, TG_CHAT_ID, msg)
 
     print("🏁 脚本执行完毕")
