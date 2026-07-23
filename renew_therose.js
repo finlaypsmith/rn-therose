@@ -181,27 +181,45 @@ async function dismissCookieConsent(page) {
     } catch (e) { /* 忽略 */ }
 }
 
-// 填邮箱/密码，填后校验真写入、非 placeholder，异常重填 —— 对齐旧 Python 版 fill+校验逻辑
+// 填邮箱/密码：优先 evaluate 直接写值（比 type 更抗 CF 重渲染），失败再回退 type
 async function fillCredentials(page) {
     log('📧 填写邮箱...');
-    // 先清空再填，避免残留
-    await page.click('#login_form_email', { clickCount: 3 }).catch(() => {});
-    await page.type('#login_form_email', EMAIL, { delay: 30 });
-    log('🔑 填写密码...');
-    await page.click('#login_form_password', { clickCount: 3 }).catch(() => {});
-    await page.type('#login_form_password', PASSWORD, { delay: 30 });
-    await sleep(400);
-    const v = await page.evaluate(() => {
+    await page.waitForSelector('#login_form_email', { timeout: 15000 });
+    await page.waitForSelector('#login_form_password', { timeout: 15000 });
+
+    const written = await page.evaluate((email, password) => {
         const e = document.querySelector('#login_form_email');
-        return e ? e.value || '' : '';
-    });
-    if (v && !v.includes(EMAIL.slice(0, 3)) && v !== EMAIL) {
-        log(`⚠️ 邮箱字段异常（值前缀 ${v.slice(0, 6)}），重填`);
-        await page.click('#login_form_email', { clickCount: 3 });
-        await page.type('#login_form_email', EMAIL, { delay: 30 });
-        await page.click('#login_form_password', { clickCount: 3 });
-        await page.type('#login_form_password', PASSWORD, { delay: 30 });
+        const p = document.querySelector('#login_form_password');
+        if (!e || !p) return { ok: false, reason: 'missing-fields' };
+        e.focus();
+        e.value = '';
+        e.value = email;
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+        e.dispatchEvent(new Event('change', { bubbles: true }));
+        p.focus();
+        p.value = '';
+        p.value = password;
+        p.dispatchEvent(new Event('input', { bubbles: true }));
+        p.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, emailVal: e.value || '' };
+    }, EMAIL, PASSWORD);
+
+    if (!written || !written.ok || written.emailVal !== EMAIL) {
+        log('⚠️ evaluate 写入异常，回退 page.type');
+        try {
+            await page.click('#login_form_email', { clickCount: 3 });
+            await page.keyboard.press('Backspace');
+            await page.type('#login_form_email', EMAIL, { delay: 20 });
+            await page.click('#login_form_password', { clickCount: 3 });
+            await page.keyboard.press('Backspace');
+            await page.type('#login_form_password', PASSWORD, { delay: 20 });
+        } catch (e) {
+            throw new Error(`填写凭证失败: ${e.message}`);
+        }
+    } else {
+        log('🔑 填写密码...');
     }
+    await sleep(400);
 }
 
 // 为 fail-closed 诊断采集登录页 DOM 状态
@@ -266,6 +284,9 @@ async function login(page) {
         throw new Error('Cloudflare Turnstile 验证未通过：未拿到有效 token，已终止（不点 Sign in）。');
     }
 
+    // Turnstile 求解期间表单可能被重渲染清空，点 Sign in 前再确认填入
+    await fillCredentials(page);
+
     log('🖱️ 点击 Sign in...');
     try {
         await page.evaluate(() => {
@@ -315,64 +336,174 @@ async function login(page) {
     throw new Error(`登录超时未跳转 Dashboard | ${diag.url || ''} | ${diag.errText || ''}`);
 }
 
-// 通用"按文本找 button 并点" —— 对齐旧 Python 版 uc_click + JS click 兜底
-async function clickButtonByText(page, text, label) {
-    const ok = await page.evaluate((t) => {
-        const btns = Array.from(document.querySelectorAll('button, span, a, [role="button"]'));
-        const b = btns.find((el) => {
-            const content = (el.textContent || (el.getAttribute && el.getAttribute('title')) || '').trim().toLowerCase();
-            return content.includes(t.toLowerCase());
-        });
-        if (b) { b.click(); return true; }
-        return false;
-    }, text);
-    if (!ok) throw new Error(`未找到 ${label} 按钮`);
-    log(`✅ 已点击 ${label}`);
-}
-
-// 检查续期成功提示 —— 收敛到一个 evaluate，对齐旧 Python 版 check_renewal_success
-async function checkRenewalSuccess(page) {
-    log('🔍 等待 5s 检查续期结果...');
-    await sleep(5000);
+// 读取 My servers 页的 Valid until 时间文本
+async function readValidUntil(page) {
     return await page.evaluate(() => {
-        const sels = ['.alert-success', '.alert.alert-success', 'div[role="alert"].alert-success', 'div.alert-success'];
-        for (const s of sels) {
-            const el = document.querySelector(s);
-            if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
-                const txt = (el.textContent || '').trim();
-                if (txt) return { ok: true, text: txt };
-            }
-        }
-        const btns = Array.from(document.querySelectorAll('span, div, button'));
-        const hit = btns.find((el) => /successfully purchased/i.test(el.textContent || ''));
-        if (hit) return { ok: true, text: (hit.textContent || '').trim() };
-        if (/successfully purchased/i.test(document.body ? document.body.innerText : '')) {
-            return { ok: true, text: '服务器已成功续期' };
-        }
-        return { ok: false, text: '未检测到续期成功提示' };
+        const body = document.body ? document.body.innerText : '';
+        // "Valid until\n2026-07-23 21:27" 或同一行
+        const m = body.match(/Valid until\s*[\n\r\t ]*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/i);
+        return m ? m[1].trim() : '';
     });
 }
 
-// 登录后续期：Extend → Order now → 检查结果
+// 检查续期结果：优先读成功/失败 alert，再比对 Valid until
+async function checkRenewalSuccess(page, validBefore = '') {
+    log('🔍 等待检查续期结果...');
+    // 给跳转/渲染一点时间
+    for (let i = 0; i < 12; i++) {
+        await sleep(1000);
+        const hit = await page.evaluate(() => {
+            // 失败 alert 优先
+            const dangerSels = ['.alert-danger', '.alert.alert-danger', 'div[role="alert"].alert-danger'];
+            for (const s of dangerSels) {
+                const el = document.querySelector(s);
+                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
+                    const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+                    if (txt) return { kind: 'error', text: txt };
+                }
+            }
+            const sels = ['.alert-success', '.alert.alert-success', 'div[role="alert"].alert-success', 'div.alert-success'];
+            for (const s of sels) {
+                const el = document.querySelector(s);
+                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
+                    const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+                    if (txt) return { kind: 'ok', text: txt };
+                }
+            }
+            const body = document.body ? document.body.innerText : '';
+            if (/successfully purchased/i.test(body)) return { kind: 'ok', text: 'successfully purchased' };
+            if (/order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i.test(body)) {
+                return { kind: 'ok', text: body.match(/successfully purchased|order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i)?.[0] || 'order completed' };
+            }
+            // 业务拒绝文案
+            if (/renewal is available only|within \d+ minutes before expiration|insufficient|not enough|error during/i.test(body)) {
+                const m = body.match(/Error during[^\n]+|Renewal is available only[^\n]+|insufficient[^\n]+/i);
+                return { kind: 'error', text: (m && m[0] || '续期被服务器拒绝').trim() };
+            }
+            return null;
+        });
+        if (hit) {
+            if (hit.kind === 'error') return { ok: false, text: hit.text };
+            return { ok: true, text: hit.text };
+        }
+    }
+
+    // 回 My servers 比对 Valid until 是否变长
+    try {
+        await page.goto('https://client.therose.cloud/panel?routeName=servers', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+        });
+        await sleep(2000);
+        const validAfter = await readValidUntil(page);
+        if (validAfter && validBefore && validAfter !== validBefore) {
+            return { ok: true, text: `Valid until ${validBefore} → ${validAfter}` };
+        }
+        if (validAfter && !validBefore) {
+            return { ok: true, text: `Valid until ${validAfter}` };
+        }
+        return {
+            ok: false,
+            text: `Valid until 未增加（前: ${validBefore || '未知'} / 后: ${validAfter || '未知'}）`,
+        };
+    } catch (e) {
+        return { ok: false, text: `结果页检查异常: ${e.message}` };
+    }
+}
+
+// 登录后续期：
+// Dashboard 没有 Extend；真正入口在 My servers 页的 a[href*="cart_renew"]
+// → cart_renew 页 #order-submit (Order now) → 检查成功提示 / Valid until 变化
 async function renew(page) {
-    await page.waitForSelector('body', { timeout: 10000 });
+    log('📂 进入 My servers...');
+    await page.goto('https://client.therose.cloud/panel?routeName=servers', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+    });
     await humanWait(2, 4);
 
+    const validBefore = await readValidUntil(page);
+    log(`🕒 续期前 Valid until: ${validBefore || '未知'}`);
+
+    // 优先点 cart_renew 链接，文本 Extend 兜底
     log('🖱️ 点击 Extend...');
-    await clickButtonByText(page, 'Extend', 'Extend');
-    await humanWait(1, 2);
+    const extendHref = await page.evaluate(() => {
+        const byHref = document.querySelector('a[href*="cart_renew"]');
+        if (byHref) {
+            const href = byHref.getAttribute('href') || '';
+            byHref.click();
+            return href;
+        }
+        const all = Array.from(document.querySelectorAll('a, button, span, [role="button"]'));
+        const byText = all.find((el) => {
+            const t = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
+            return t === 'extend' || t.includes('extend');
+        });
+        if (byText) {
+            byText.click();
+            return byText.getAttribute('href') || 'clicked-by-text';
+        }
+        return '';
+    });
+    if (!extendHref) {
+        try { await page.screenshot({ path: 'artifacts/no_extend.png', fullPage: true }); } catch (e) {}
+        throw new Error('未找到 Extend 按钮（My servers 页无 cart_renew 链接）');
+    }
+    log(`✅ 已点击 Extend（${extendHref}）`);
+
+    // 等进入 cart_renew 或出现 Order now
+    let onCart = false;
+    for (let i = 0; i < 20; i++) {
+        const url = page.url();
+        const hasOrder = await page.evaluate(() => {
+            if (document.querySelector('#order-submit')) return true;
+            return Array.from(document.querySelectorAll('button, a')).some(
+                (el) => /order now/i.test((el.textContent || '').trim())
+            );
+        }).catch(() => false);
+        if (url.includes('cart_renew') || hasOrder) {
+            onCart = true;
+            break;
+        }
+        await sleep(500);
+    }
+    if (!onCart && extendHref.startsWith('/')) {
+        // click 可能没导航成功，直接 goto
+        await page.goto(`https://client.therose.cloud${extendHref}`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+        });
+        await humanWait(2, 3);
+    } else {
+        await humanWait(1, 2);
+    }
 
     log('🛒 点击 Order now...');
-    await clickButtonByText(page, 'Order now', 'Order now');
+    const ordered = await page.evaluate(() => {
+        const byId = document.querySelector('#order-submit');
+        if (byId) { byId.click(); return true; }
+        const btns = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
+        const b = btns.find((el) => /order now/i.test((el.textContent || el.value || '').trim()));
+        if (b) { b.click(); return true; }
+        return false;
+    });
+    if (!ordered) {
+        try { await page.screenshot({ path: 'artifacts/no_order_now.png', fullPage: true }); } catch (e) {}
+        throw new Error('未找到 Order now 按钮');
+    }
+    log('✅ 已点击 Order now');
 
-    const result = await checkRenewalSuccess(page);
+    // 等导航/响应
+    await sleep(3000);
+
+    const result = await checkRenewalSuccess(page, validBefore);
     if (result.ok) {
         log(`✅ 续期成功: ${result.text}`);
-        try { await page.screenshot({ path: 'artifacts/renewal_ok.png' }); } catch (e) {}
+        try { await page.screenshot({ path: 'artifacts/renewal_ok.png', fullPage: true }); } catch (e) {}
         return { ok: true, text: result.text };
     }
     log(`❌ 续期可能失败: ${result.text}`);
-    try { await page.screenshot({ path: 'artifacts/renewal_fail.png' }); } catch (e) {}
+    try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
     return { ok: false, text: result.text };
 }
 
