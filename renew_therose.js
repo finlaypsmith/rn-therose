@@ -315,5 +315,66 @@ async function login(page) {
     throw new Error(`登录超时未跳转 Dashboard | ${diag.url || ''} | ${diag.errText || ''}`);
 }
 
+// 通用"按文本找 button 并点" —— 对齐旧 Python 版 uc_click + JS click 兜底
+async function clickButtonByText(page, text, label) {
+    const ok = await page.evaluate((t) => {
+        const btns = Array.from(document.querySelectorAll('button, span, a, [role="button"]'));
+        const b = btns.find((el) => {
+            const content = (el.textContent || (el.getAttribute && el.getAttribute('title')) || '').trim().toLowerCase();
+            return content.includes(t.toLowerCase());
+        });
+        if (b) { b.click(); return true; }
+        return false;
+    }, text);
+    if (!ok) throw new Error(`未找到 ${label} 按钮`);
+    log(`✅ 已点击 ${label}`);
+}
+
+// 检查续期成功提示 —— 收敛到一个 evaluate，对齐旧 Python 版 check_renewal_success
+async function checkRenewalSuccess(page) {
+    log('🔍 等待 5s 检查续期结果...');
+    await sleep(5000);
+    return await page.evaluate(() => {
+        const sels = ['.alert-success', '.alert.alert-success', 'div[role="alert"].alert-success', 'div.alert-success'];
+        for (const s of sels) {
+            const el = document.querySelector(s);
+            if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
+                const txt = (el.textContent || '').trim();
+                if (txt) return { ok: true, text: txt };
+            }
+        }
+        const btns = Array.from(document.querySelectorAll('span, div, button'));
+        const hit = btns.find((el) => /successfully purchased/i.test(el.textContent || ''));
+        if (hit) return { ok: true, text: (hit.textContent || '').trim() };
+        if (/successfully purchased/i.test(document.body ? document.body.innerText : '')) {
+            return { ok: true, text: '服务器已成功续期' };
+        }
+        return { ok: false, text: '未检测到续期成功提示' };
+    });
+}
+
+// 登录后续期：Extend → Order now → 检查结果
+async function renew(page) {
+    await page.waitForSelector('body', { timeout: 10000 });
+    await humanWait(2, 4);
+
+    log('🖱️ 点击 Extend...');
+    await clickButtonByText(page, 'Extend', 'Extend');
+    await humanWait(1, 2);
+
+    log('🛒 点击 Order now...');
+    await clickButtonByText(page, 'Order now', 'Order now');
+
+    const result = await checkRenewalSuccess(page);
+    if (result.ok) {
+        log(`✅ 续期成功: ${result.text}`);
+        try { await page.screenshot({ path: 'artifacts/renewal_ok.png' }); } catch (e) {}
+        return { ok: true, text: result.text };
+    }
+    log(`❌ 续期可能失败: ${result.text}`);
+    try { await page.screenshot({ path: 'artifacts/renewal_fail.png' }); } catch (e) {}
+    return { ok: false, text: result.text };
+}
+
 // 纯逻辑导出，供 tests/ 断言
 module.exports = { maskEmail, timeToSeconds };
