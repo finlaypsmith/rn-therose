@@ -6,3 +6,5 @@
 .pytest_cache/
 /node_modules/
 /artifacts/
+.env
+**/.env
