@@ -359,7 +359,11 @@ async function checkRenewalSuccess(page, validBefore = '') {
                 const el = document.querySelector(s);
                 if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
                     const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
-                    if (txt) return { kind: 'error', text: txt };
+                    if (!txt) continue;
+                    if (/renewal is available only|within \d+ minutes before expiration/i.test(txt)) {
+                        return { kind: 'not_due', text: txt };
+                    }
+                    return { kind: 'error', text: txt };
                 }
             }
             const sels = ['.alert-success', '.alert.alert-success', 'div[role="alert"].alert-success', 'div.alert-success'];
@@ -375,16 +379,22 @@ async function checkRenewalSuccess(page, validBefore = '') {
             if (/order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i.test(body)) {
                 return { kind: 'ok', text: body.match(/successfully purchased|order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i)?.[0] || 'order completed' };
             }
-            // 业务拒绝文案
-            if (/renewal is available only|within \d+ minutes before expiration|insufficient|not enough|error during/i.test(body)) {
-                const m = body.match(/Error during[^\n]+|Renewal is available only[^\n]+|insufficient[^\n]+/i);
+            // 未到续期窗口：这是站点业务限制，不是脚本失败
+            if (/renewal is available only|within \d+ minutes before expiration/i.test(body)) {
+                const m = body.match(/Renewal is available only[^\n]+|Error during creating the server:\s*Renewal is available only[^\n]+/i);
+                return { kind: 'not_due', text: (m && m[0] || '未到续期时间：仅到期前 30 分钟可续期').trim() };
+            }
+            // 其他业务拒绝文案才视为续期失败
+            if (/insufficient|not enough|error during/i.test(body)) {
+                const m = body.match(/Error during[^\n]+|insufficient[^\n]+|not enough[^\n]+/i);
                 return { kind: 'error', text: (m && m[0] || '续期被服务器拒绝').trim() };
             }
             return null;
         });
         if (hit) {
-            if (hit.kind === 'error') return { ok: false, text: hit.text };
-            return { ok: true, text: hit.text };
+            if (hit.kind === 'error') return { ok: false, status: 'failed', text: hit.text };
+            if (hit.kind === 'not_due') return { ok: false, status: 'not_due', text: hit.text };
+            return { ok: true, status: 'success', text: hit.text };
         }
     }
 
@@ -397,17 +407,18 @@ async function checkRenewalSuccess(page, validBefore = '') {
         await sleep(2000);
         const validAfter = await readValidUntil(page);
         if (validAfter && validBefore && validAfter !== validBefore) {
-            return { ok: true, text: `Valid until ${validBefore} → ${validAfter}` };
+            return { ok: true, status: 'success', text: `Valid until ${validBefore} → ${validAfter}` };
         }
         if (validAfter && !validBefore) {
-            return { ok: true, text: `Valid until ${validAfter}` };
+            return { ok: true, status: 'success', text: `Valid until ${validAfter}` };
         }
         return {
             ok: false,
+            status: 'failed',
             text: `Valid until 未增加（前: ${validBefore || '未知'} / 后: ${validAfter || '未知'}）`,
         };
     } catch (e) {
-        return { ok: false, text: `结果页检查异常: ${e.message}` };
+        return { ok: false, status: 'failed', text: `结果页检查异常: ${e.message}` };
     }
 }
 
@@ -500,11 +511,16 @@ async function renew(page) {
     if (result.ok) {
         log(`✅ 续期成功: ${result.text}`);
         try { await page.screenshot({ path: 'artifacts/renewal_ok.png', fullPage: true }); } catch (e) {}
-        return { ok: true, text: result.text };
+        return { ok: true, status: result.status || 'success', text: result.text };
+    }
+    if (result.status === 'not_due') {
+        log(`⏳ 未到续期时间: ${result.text}`);
+        try { await page.screenshot({ path: 'artifacts/renewal_not_due.png', fullPage: true }); } catch (e) {}
+        return { ok: false, status: 'not_due', text: result.text };
     }
     log(`❌ 续期可能失败: ${result.text}`);
     try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
-    return { ok: false, text: result.text };
+    return { ok: false, status: result.status || 'failed', text: result.text };
 }
 
 // 从 My servers 找 Manage server 链接并进入面板页（panel.therose.cloud/server/<id>）
@@ -553,20 +569,22 @@ async function startServerIfStopped(page) {
         const body = document.body ? document.body.innerText : '';
         const startButton = buttons.find((b) => /^Start$/i.test(b.text) && b.visible && !b.disabled);
         const stopButton = buttons.find((b) => /^Stop$/i.test(b.text) && b.visible);
+        const stopReady = !!(stopButton && !stopButton.disabled);
         const offline = /\bOffline\b|\bStopped\b/i.test(body);
-        const running = /\bRunning\b|\bOnline\b/i.test(body) || !!(stopButton && !stopButton.disabled && !offline);
+        const running = /\bRunning\b|\bOnline\b/i.test(body) || stopReady;
         return {
             offline,
             running,
             canStart: !!startButton,
+            stopReady,
             stopDisabled: !!(stopButton && stopButton.disabled),
             buttons,
         };
     });
 
-    log(`🩺 服务器状态诊断: ${JSON.stringify({ offline: state.offline, running: state.running, canStart: state.canStart, stopDisabled: state.stopDisabled })}`);
-    if (state.running && !state.canStart) {
-        return { started: false, needed: false, text: '服务器已在运行，无需启动' };
+    log(`🩺 服务器状态诊断: ${JSON.stringify({ offline: state.offline, running: state.running, canStart: state.canStart, stopReady: state.stopReady, stopDisabled: state.stopDisabled })}`);
+    if (state.running) {
+        return { started: false, needed: false, text: '服务器已在运行或正在启动，无需启动' };
     }
     if (!state.offline && !state.canStart && !state.stopDisabled) {
         return { started: false, needed: false, text: '未检测到停止状态，无需启动' };
@@ -656,13 +674,18 @@ async function main() {
             log(`⚠️ ${startText}`);
             try { await page.screenshot({ path: 'artifacts/server_start_error.png', fullPage: true }); } catch (x) {}
         }
+        const renewalText = r.status === 'not_due'
+            ? `⏳ 未到续期时间：仅到期前 30 分钟可续期（${r.text}）`
+            : r.text;
         const extra = [
-            r.text,
+            renewalText,
             startText,
             egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : '',
         ].filter(Boolean).join(' | ');
         if (r.ok) {
             await sendTelegram(formatNotification('✅ 续期成功', extra));
+        } else if (r.status === 'not_due') {
+            await sendTelegram(formatNotification('⏳ 未到续期时间', extra));
         } else {
             await sendTelegram(formatNotification('❌ 续期可能失败', extra, r.text));
         }
