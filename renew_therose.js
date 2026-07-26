@@ -507,6 +507,105 @@ async function renew(page) {
     return { ok: false, text: result.text };
 }
 
+// 从 My servers 找 Manage server 链接并进入面板页（panel.therose.cloud/server/<id>）
+async function openServerManager(page) {
+    log('📂 进入 My servers 检查 Manage server...');
+    await page.goto('https://client.therose.cloud/panel?routeName=servers', {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+    });
+    await humanWait(2, 4);
+
+    const manageHref = await page.evaluate(() => {
+        const byHref = document.querySelector('a[href*="/sso/redirect"][href*="server/"]');
+        if (byHref) return byHref.getAttribute('href') || '';
+        const a = Array.from(document.querySelectorAll('a')).find((el) => {
+            const t = (el.textContent || el.getAttribute('title') || '').trim();
+            return /manage server/i.test(t);
+        });
+        return a ? (a.getAttribute('href') || '') : '';
+    });
+    if (!manageHref) {
+        try { await page.screenshot({ path: 'artifacts/no_manage_server.png', fullPage: true }); } catch (e) {}
+        throw new Error('未找到 Manage server 链接');
+    }
+
+    const target = manageHref.startsWith('http')
+        ? manageHref
+        : `https://client.therose.cloud${manageHref}`;
+    log(`🧭 进入服务器管理页: ${manageHref}`);
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await sleep(8000);
+    return page.url();
+}
+
+// 续期后如果服务器是 Offline/Stopped，则进入管理页点击 Start
+async function startServerIfStopped(page) {
+    log('🔎 检查服务器运行状态...');
+    const managerUrl = await openServerManager(page);
+    const state = await page.evaluate(() => {
+        const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        const buttons = Array.from(document.querySelectorAll('button')).map((b) => ({
+            text: (b.textContent || '').trim(),
+            disabled: !!b.disabled,
+            visible: visible(b),
+        }));
+        const body = document.body ? document.body.innerText : '';
+        const startButton = buttons.find((b) => /^Start$/i.test(b.text) && b.visible && !b.disabled);
+        const stopButton = buttons.find((b) => /^Stop$/i.test(b.text) && b.visible);
+        const offline = /\bOffline\b|\bStopped\b/i.test(body);
+        const running = /\bRunning\b|\bOnline\b/i.test(body) || !!(stopButton && !stopButton.disabled && !offline);
+        return {
+            offline,
+            running,
+            canStart: !!startButton,
+            stopDisabled: !!(stopButton && stopButton.disabled),
+            buttons,
+        };
+    });
+
+    log(`🩺 服务器状态诊断: ${JSON.stringify({ offline: state.offline, running: state.running, canStart: state.canStart, stopDisabled: state.stopDisabled })}`);
+    if (state.running && !state.canStart) {
+        return { started: false, needed: false, text: '服务器已在运行，无需启动' };
+    }
+    if (!state.offline && !state.canStart && !state.stopDisabled) {
+        return { started: false, needed: false, text: '未检测到停止状态，无需启动' };
+    }
+    if (!state.canStart) {
+        try { await page.screenshot({ path: 'artifacts/server_start_unavailable.png', fullPage: true }); } catch (e) {}
+        throw new Error(`检测到停止状态但 Start 按钮不可用: ${JSON.stringify(state)}`);
+    }
+
+    await page.evaluate(() => {
+        const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+        const b = Array.from(document.querySelectorAll('button')).find(
+            (el) => /^Start$/i.test((el.textContent || '').trim()) && visible(el) && !el.disabled
+        );
+        if (!b) throw new Error('Start 按钮不存在或不可点击');
+        b.click();
+    });
+    log('🚀 已点击 Start，等待服务器启动...');
+
+    for (let i = 0; i < 30; i++) {
+        await sleep(2000);
+        const ok = await page.evaluate(() => {
+            const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            const stop = Array.from(document.querySelectorAll('button')).find(
+                (el) => /^Stop$/i.test((el.textContent || '').trim()) && visible(el)
+            );
+            const body = document.body ? document.body.innerText : '';
+            return /\bRunning\b|\bOnline\b|\bStarting\b/i.test(body) || !!(stop && !stop.disabled);
+        });
+        if (ok) {
+            try { await page.screenshot({ path: 'artifacts/server_start_ok.png', fullPage: true }); } catch (e) {}
+            return { started: true, needed: true, text: `服务器已自动启动（${managerUrl}）` };
+        }
+    }
+
+    try { await page.screenshot({ path: 'artifacts/server_start_fail.png', fullPage: true }); } catch (e) {}
+    throw new Error('已点击 Start，但 60 秒内未检测到 Running/Online/Stop 可用');
+}
+
 
 async function main() {
     if (!EMAIL || !PASSWORD) {
@@ -548,7 +647,20 @@ async function main() {
 
     try {
         const r = await renew(page);
-        const extra = [r.text, egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : ''].filter(Boolean).join(' | ');
+        let startText = '';
+        try {
+            const start = await startServerIfStopped(page);
+            startText = start.text;
+        } catch (startErr) {
+            startText = `服务器启动检查失败: ${startErr.message}`;
+            log(`⚠️ ${startText}`);
+            try { await page.screenshot({ path: 'artifacts/server_start_error.png', fullPage: true }); } catch (x) {}
+        }
+        const extra = [
+            r.text,
+            startText,
+            egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : '',
+        ].filter(Boolean).join(' | ');
         if (r.ok) {
             await sendTelegram(formatNotification('✅ 续期成功', extra));
         } else {
