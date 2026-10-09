@@ -252,6 +252,52 @@ async function diagnosePage(page) {
     }
 }
 
+// 采集环境信号：CI 与本机环境的差异点（Chrome 版本、时区、语言、自动化标记）
+async function probeEnvironment(page) {
+    try {
+        return await page.evaluate(() => ({
+            ua: (navigator.userAgent || '').slice(0, 120),
+            platform: navigator.platform,
+            languages: (navigator.languages || []).join(','),
+            hardwareConcurrency: navigator.hardwareConcurrency,
+            deviceMemory: navigator.deviceMemory,
+            webdriver: navigator.webdriver,
+            timezone: (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { return '未知'; } })(),
+            screen: `${window.screen.width}x${window.screen.height}`,
+            dpr: window.devicePixelRatio,
+        }));
+    } catch (e) {
+        return { error: e.message };
+    }
+}
+
+// 探测 WebRTC 是否泄露：ICE candidate 里的地址即页面 JS 能读到的出口地址。
+// 出现 srflx（STUN 公网映射）且与本机/代理出口 IP 不一致 = 真实 IP 被暴露。
+// 经 --proxy-server=socks5 时 UDP 不代理，STUN 会直连出去，故此项在 CI 上尤需确认。
+async function probeWebRtc(page) {
+    try {
+        const out = await page.evaluate(() => new Promise((resolve) => {
+            const res = { candidates: [], error: null };
+            try {
+                const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+                const finish = () => { try { pc.close(); } catch (e) {} resolve(res); };
+                const timer = setTimeout(finish, 8000);
+                pc.onicecandidate = (e) => {
+                    if (!e.candidate) { clearTimeout(timer); finish(); return; }
+                    const c = e.candidate.candidate || '';
+                    const m = /candidate:\S+ \d+ \S+ \d+ (\S+) \d+ typ (\w+)/.exec(c);
+                    res.candidates.push(m ? `${m[1]} (${m[2]})` : c.slice(0, 60));
+                };
+                pc.createDataChannel('t');
+                pc.createOffer().then((o) => pc.setLocalDescription(o)).catch((e) => { res.error = e.message; });
+            } catch (e) { res.error = e.message; resolve(res); }
+        }));
+        return { candidates: [...new Set(out.candidates)], error: out.error };
+    } catch (e) {
+        return { error: e.message };
+    }
+}
+
 // 登录流程：过盾 → fail-closed → 点 Sign in → 等跳 /panel|/dashboard
 async function login(page) {
     log('🌐 打开登录页面...');
@@ -282,6 +328,9 @@ async function login(page) {
     if (!tokenOk) {
         const diag = await diagnosePage(page);
         log(`🩺 登录诊断: ${JSON.stringify(diag)}`);
+        // Turnstile 不放行时排查环境信号：WebRTC 是否绕过 socks5 代理暴露真实 IP
+        log(`🩺 环境诊断: ${JSON.stringify(await probeEnvironment(page))}`);
+        log(`🩺 WebRTC 泄漏诊断: ${JSON.stringify(await probeWebRtc(page))}`);
         try { await page.screenshot({ path: 'artifacts/turnstile_fail.png' }); } catch (e) {}
         throw new Error('Cloudflare Turnstile 验证未通过：未拿到有效 token，已终止（不点 Sign in）。');
     }
@@ -706,4 +755,4 @@ if (require.main === module) {
 }
 
 // 导出各阶段函数，便于验证脚本直接跑真实流程（不改变 `node renew_therose.js` 的行为）
-module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, main };
+module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, main };
