@@ -2,20 +2,25 @@
 
 - 日期：2026-10-09
 - 影响文件：`renew_therose.js`
-- 修复提交：`4596a18`（根因一）、`3ecd9f0`（根因二）
+- 修复提交：`4596a18`（根因一）、`3ecd9f0`（根因二）、`b27c9f6`（根因三）
 
 ## 摘要
 
-同一个现象——登录阶段稳定失败、Turnstile token 恒为 0——背后是**两个互相独立的根因**，
-必须分开排查。
+同一个现象——登录阶段稳定失败、Turnstile token 恒为 0——背后是**三个互相独立的根因**，
+必须逐个排查。三者都不在预期方向上：既不是 CF 变严，也不是代理或凭证问题。
 
 | # | 根因 | 修复 |
 |---|---|---|
 | 一 | `puppeteer-real-browser` 内置求解器误点 **Sign in**，表单反复提交、页面不断重导航，Turnstile 流程被打断 | `turnstile: true` → `false` |
-| 二 | `--proxy-server=socks5` 只代理 TCP，**WebRTC 的 STUN(UDP) 绕过代理**，把 runner 真实 IP 经 ICE candidate 交给页面 JS，CF 据此判定 IP 不一致而拒绝放行 | 加 `--webrtc-ip-handling-policy=disable_non_proxied_udp` |
+| 二 | `--proxy-server=socks5` 只代理 TCP，**WebRTC 的 STUN(UDP) 绕过代理**，把 runner 真实 IP 经 ICE candidate 交给页面 JS | 加 `--webrtc-ip-handling-policy=disable_non_proxied_udp` |
+| 三 | GitHub Actions runner 默认时区为 **UTC**，真人浏览器几乎不会是 UTC，CF 据此判为数据中心/自动化而拒绝放行 | 将 `process.env.TZ` 设为正常时区 |
 
-两者都不在预期方向上：既不是 CF 变严，也不是代理或凭证问题。**根因一修完本机通过、CI 仍
-失败**，这个"只在 CI 复现"的差异正是根因二的入口。
+排查过程是一层层剥出来的，前两次修复都"确实生效了、但没能解决问题"，直到下一个根因暴露：
+
+- 修完根因一：**本机通过、CI 仍失败** → "只在 CI 复现"这个差异指向根因二；
+- 修完根因二：WebRTC 泄漏确实消除（`srflx` 从 candidate 列表消失），**CI 仍失败**
+  → 它是个真实缺陷，却不是本次失败的原因。**这一步的教训：修复"生效了"不等于"修对了地方"**；
+- 根因三是最后一块拼图：本机把 `TZ` 设为 `UTC` 即可稳定复现 CI 的失败。
 
 ## 共同现象
 
@@ -156,28 +161,89 @@ webrtc-ip-handling-policy
 UDP ASSOCIATE 就得到与 HTTP 出口一致的 srflx，不支持则没有 UDP candidate——两种结果都
 不再泄漏真实 IP。
 
+## 根因三：浏览器时区为 UTC
+
+根因二修复后，CI 的 `srflx` 确实消失了（`candidates: []`），**但 token 依然拿不到**。
+本机在完全相同的 WebRTC 状态下却 15 秒通过——说明 WebRTC 虽是真缺陷，却不是失败原因。
+
+于是回到"本机 vs CI 的差异"清单，把诊断里那几个本机可模拟的信号逐个试：
+
+| 变量 | CI | 本机 | 结论 |
+|---|---|---|---|
+| 代理方式 | `--proxy-server=socks5` | TUN | 本机自建 socks5 中继复现后也通过 → **排除** |
+| WebRTC | 已修复为 `[]` | `[]` | 两者一致 → **排除** |
+| **时区** | **UTC** | Asia/Hong_Kong | `TZ` 环境变量可直接模拟 → **复现** |
+
+socks5 那项值得单独记一笔：本机没有 socks5 端口，为此写了个只做 TCP CONNECT 转发的
+中继（`.tmp/probe/socks5-relay.js`）来模拟 CI 的代理方式，结果**本机走 socks5 也 9 秒通过**，
+据此把"代理方式"整个排除。
+
+### 确诊
+
+```
+$ TZ=UTC xvfb-run -a node …verify-login.js
+[07:16:46] ⏳ 仍未拿到 token（若持续如此，CF 可能改判为 interactive challenge）...
+[07:17:46] ⏳ 第 1 次未拿到 token，重试...
+[07:18:21] ⏳ 仍未拿到 token...
+```
+
+同一出口 IP、同一份代码，仅改 `TZ`：
+
+| 浏览器时区 | 结果 |
+|---|---|
+| `Asia/Hong_Kong`（本机默认） | 成功 ×5 |
+| `America/Sao_Paulo` | 成功（13s） |
+| `UTC` | **失败 ×2** |
+
+`UTC` 是 GitHub Actions runner 的默认时区，也是真人浏览器的**非典型**时区——普通用户的
+浏览器时区跟着物理位置走，几乎不会停在 UTC，因此它被 CF 当作数据中心/自动化特征。
+
+注意这与"时区要匹配 IP 地理位置"不是一回事：出口 IP 在巴西，本机用 `Asia/Hong_Kong`
+（相差 11 小时）照样通过，说明 CF 并不强求时区与 IP 一致，而是对 `UTC` 这个**特定值**敏感。
+
+### 修复
+
+```js
+process.env.TZ = process.env.RENEW_TZ || 'America/Sao_Paulo';
+```
+
+必须早于浏览器启动——Chrome 由 chrome-launcher 以子进程拉起，继承 `process.env`。
+
+两处细节：
+
+- **不读系统 `TZ`**，改用独立的 `RENEW_TZ` 作为覆盖点。CI 上系统 `TZ`（或 runner 的
+  `/etc/localtime`）恰恰就是出问题的 UTC，若写成 `process.env.TZ || '…'` 会保留 UTC、修复失效。
+- 取与该代理出口 IP（190.5.208.24，巴西 Recife）地理一致的时区。实测 CF 并不强求一致，
+  但一致总归更自然；节点若更换，可用 `RENEW_TZ` 覆盖。
+
 ## 验证
 
-端到端（真实 `launchRealBrowser()` + `login()`，只登录、不执行 `renew()`，无续期副作用）：
+端到端（真实 `launchRealBrowser()` + `login()`，只登录、不执行 `renew()`，无续期副作用）。
+最关键的一次是**外部强制 `TZ=UTC` 模拟 runner 条件**，由脚本内部覆盖：
 
 ```
-[14:22:21] 🌐 打开登录页面...
-[14:22:46] ✅ Turnstile token 已就绪（长度 709）
-[14:22:53] ✅ 登录成功，已跳转: https://client.therose.cloud/panel
+$ TZ=UTC xvfb-run -a node …verify-diag.js
+🩺 环境诊断: {…,"timezone":"America/Sao_Paulo",…}
+                                ↑ 外部给的是 UTC，已被脚本覆盖
+
+$ TZ=UTC xvfb-run -a node …verify-login.js
+[04:28:48] ✅ Turnstile token 已就绪（长度 709）
+[04:28:55] ✅ 登录成功，已跳转: https://client.therose.cloud/panel
 ```
 
-修复前后对比：
+即：CI 的时区条件 + 修复后的脚本 = 通过。
 
-| 阶段 | 结果 |
-|---|---|
-| 修复前 | 3 轮 × 90s 全部超时 |
-| 只修根因一（本机） | 11–14s 拿到 token，登录成功 |
-| 只修根因一（CI） | 3 轮 × 90s 仍全部超时 |
-| 修根因一 + 二（本机） | 15s 拿到 token，登录成功；`candidates: []` |
+各阶段汇总：
 
-关键一项：加了该策略后本机 WebRTC 完全不可用（0 个 candidate），**登录依然成功**——
-说明「WebRTC 无 candidate」不会反过来被 CF 判死，否则本机就会立刻失败。这排除了修复
-本身引入新矛盾的可能。
+| 阶段 | 本机 | CI |
+|---|---|---|
+| 修复前 | 3 轮 × 90s 超时 | 3 轮 × 90s 超时 |
+| 只修根因一 | 11–14s 通过 | 3 轮 × 90s 仍超时 |
+| 修根因一 + 二 | 15s 通过，`candidates: []` | 仍超时，`candidates: []` |
+| 修根因一 + 二 + 三 | 通过（含 `TZ=UTC` 模拟） | **待复核** |
+
+另有一条附带的排除性证据：加 WebRTC 策略后本机 WebRTC 完全不可用（0 个 candidate），
+**登录依然成功**——说明「WebRTC 无 candidate」不会反过来被 CF 判死，否则本机就会立刻失败。
 
 **CI 侧尚待复核**：最后一次 `workflow_dispatch` 需再跑一次确认。
 
@@ -191,6 +257,11 @@ UDP ASSOCIATE 就得到与 HTTP 出口一致的 srflx，不支持则没有 UDP c
    而不是直接恢复 `turnstile: true`。
 3. **诊断代码保留**：环境诊断与 WebRTC 探测挂在登录失败分支上，后续 CF 侧再出问题时可
    直接复用，不必重新搭排查脚手架。
+4. **时区按出口 IP 硬编码**：`America/Sao_Paulo` 是依当前代理出口 IP（巴西）选的，节点
+   若换到别国可用 `RENEW_TZ` 调整。实测 CF 并不强求时区与 IP 一致（本机用
+   `Asia/Hong_Kong` 也能过），但这属于未验证的边界，不宜依赖。
+5. **CF 判定会变**：三个根因都是多信号综合判定的结果，CF 侧规则也随时可能调整。再出
+   问题时先跑失败诊断（环境 + WebRTC）拿数据，不要直接改代码猜。
 
 ## 参考
 
@@ -198,6 +269,7 @@ UDP ASSOCIATE 就得到与 HTTP 出口一致的 srflx，不支持则没有 UDP c
   - `turnstile-diagnose3.js` 对照实验（开/关求解器）
   - `turnstile-diagnose4.js` 拦截误点，验证因果
   - `webrtc-flag-test.js` 比对 candidate 数，确认开关名有效
+  - `socks5-relay.js` 本机 SOCKS5 中继，模拟 CI 的 `--proxy-server` 条件
   - `verify-login.js` 端到端登录验证
   - `verify-diag.js` 诊断输出验证
 - 相关设计文档：`docs/superpowers/specs/2026-07-24-renew-therose-puppeteer-real-design.md`
