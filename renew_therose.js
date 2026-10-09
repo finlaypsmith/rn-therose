@@ -1,10 +1,12 @@
 /**
  * The Rose Cloud 自动续期（puppeteer-real-browser 版）
  *
- * 过 Cloudflare Turnstile 的核心：puppeteer-real-browser 的 turnstile:true 自动求解，
- * 且其反检测指纹足够真，通常让 CF 直接 invisible 放行、不弹 interactive challenge。
+ * 过 Cloudflare Turnstile 的核心：puppeteer-real-browser 的反检测指纹足够真，
+ * 让 CF 直接 invisible 放行、不弹 interactive challenge。
  * 这是 SeleniumBase + uc_gui_click_captcha（在 Xvfb 里物理坐标点 Turnstile）被判可疑、
  * 拿不到 token 的死结所在。
+ * 注意：puppeteer-real-browser 内置的自动求解器（turnstile:true）在本站登录页会误点
+ * Sign in 按钮、导致页面反复重导航，已关闭 —— 原因见 launchRealBrowser() 的注释。
  *
  * 流程：启动过盾浏览器（挂代理）→ 出口 IP 自检 → 打开登录页 → 关 cookie 弹窗 →
  *   填凭证 → 轮询 cf-turnstile-response token 非空为唯一权威信号（fail-closed，无 token 不点 Sign in）
@@ -71,13 +73,6 @@ function nowBeijing() {
     return `${beijing.getUTCFullYear()}-${pad(beijing.getUTCMonth() + 1)}-${pad(beijing.getUTCDate())} ${pad(beijing.getUTCHours())}:${pad(beijing.getUTCMinutes())}:${pad(beijing.getUTCSeconds())}`;
 }
 
-// 掩码出口 IP：只打点分首尾段，如 1.2.***.4
-function maskIp(ip) {
-    const p = String(ip || '').split('.');
-    if (p.length === 4) return `${p[0]}.${p[1]}.***.${p[3]}`;
-    return '未知';
-}
-
 // 发送 Telegram 通知（与旧 Python 版 send_tg 等价）
 async function sendTelegram(message) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
@@ -122,7 +117,14 @@ async function launchRealBrowser() {
     try {
         ({ browser, page } = await connect({
             headless: false,
-            turnstile: true,             // 自动求解 Cloudflare Turnstile（替代旧版 uc_gui_click_captcha）
+            // 关闭内置 Turnstile 求解器（原 turnstile:true）。该求解器按「widget 宽 300×65」假设，
+            // 取 [name="cf-turnstile-response"] 父元素的 (左边缘+30, 垂直中心) 作为点击点；
+            // 本站 .cf-turnstile 实为 480×70 整宽容器，且渲染完成前高度为 0，
+            // 该坐标此时正好落在下方重叠的 Sign in 按钮上 —— 求解器每 1s 点一次，
+            // 表单被反复提交、页面不断重导航回 /login，Turnstile 流程被打断，token 永远为空。
+            // 实测本反检测指纹 + 出口 IP 下 CF 直接 invisible 放行（15–25s 出 token），无需点击。
+            // 该开关只控制求解循环，不影响反检测 flags 与指纹注入。
+            turnstile: false,
             disableXvfb: true,            // 外层 workflow 已用 xvfb-run，避免嵌套 X server 冲突
             connectOption: { defaultViewport: null, executablePath: '/usr/bin/google-chrome' },
             args,
@@ -152,16 +154,16 @@ async function getTurnstileToken(page) {
     }
 }
 
-// 轮询等 Turnstile 被 puppeteer-real-browser 自动求解：唯一权威信号 = token 非空
+// 轮询等 Turnstile 通过：唯一权威信号 = token 非空
 async function waitTurnstileToken(page, timeoutS = 60) {
-    log('📡 等待 puppeteer-real-browser 自动求解 Turnstile...');
+    log('📡 等待 Cloudflare Turnstile 自动放行（invisible 验证，以 token 非空为准）...');
     for (let i = 0; i < timeoutS; i++) {
         const token = await getTurnstileToken(page);
         if (token) {
             log(`✅ Turnstile token 已就绪（长度 ${token.length}）`);
             return true;
         }
-        if (i === 20) log('⏳ Turnstile 仍在求解中（可能出现 interactive checkbox，自动求解器处理中）...');
+        if (i === 20) log('⏳ 仍未拿到 token（若持续如此，CF 可能改判为 interactive challenge）...');
         await sleep(1500);
     }
     return false;
@@ -255,7 +257,7 @@ async function login(page) {
     log('🌐 打开登录页面...');
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await humanWait(2, 4);
-    // 若被 CF 拦到 challenge 中间页，puppeteer-real-browser 会自动求解；给一点缓冲
+    // 若被 CF 拦到 challenge 中间页，CF 会自行 invisible 放行；给一点缓冲
     await dismissCookieConsent(page);
 
     let tokenOk = false;
@@ -263,7 +265,7 @@ async function login(page) {
         // 每轮先确保凭证在（Turnstile 重新触发可能清表单）
         await fillCredentials(page);
 
-        // puppeteer-real-browser turnstile:true 在后台自动求解，我们只等 token
+        // Turnstile 由 CF 在后台 invisible 放行，我们只轮询 token
         if (await waitTurnstileToken(page, 60)) {
             tokenOk = true;
             break;
@@ -647,7 +649,7 @@ async function main() {
         else log('🍭 未使用代理，直连访问');
         await page.goto('https://api.ip.sb/ip', { waitUntil: 'domcontentloaded', timeout: 30000 });
         egressIp = await page.evaluate(() => (document.body.innerText || '').trim()).catch(() => '');
-        log(`📍 当前出口IP: ${maskIp(egressIp)}`);
+        log(`📍 当前出口IP: ${egressIp || '未知'}`);
     } catch (e) {
         log(`⚠️ 获取出口 IP 失败: ${e.message}`);
         // 代理异常提前暴露，但不直接终止：继续尝试登录，让 Turnstile 失败做最终判定
@@ -657,7 +659,7 @@ async function main() {
         await login(page);
     } catch (e) {
         log(`❌ 登录失败: ${e.message}`);
-        const extra = egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : '';
+        const extra = egressIp ? `🌐 出口IP: ${egressIp}` : '';
         await sendTelegram(formatNotification('❌ 登录失败', extra, e.message));
         try { await browser.close(); } catch (x) {}
         return;
@@ -680,7 +682,7 @@ async function main() {
         const extra = [
             renewalText,
             startText,
-            egressIp ? `🌐 出口IP: ${maskIp(egressIp)}` : '',
+            egressIp ? `🌐 出口IP: ${egressIp}` : '',
         ].filter(Boolean).join(' | ');
         if (r.ok) {
             await sendTelegram(formatNotification('✅ 续期成功', extra));
@@ -702,3 +704,6 @@ async function main() {
 if (require.main === module) {
     main();
 }
+
+// 导出各阶段函数，便于验证脚本直接跑真实流程（不改变 `node renew_therose.js` 的行为）
+module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, main };
