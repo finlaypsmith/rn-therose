@@ -109,6 +109,14 @@ async function launchRealBrowser() {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--window-size=1280,1200',
+        // 禁止 WebRTC 使用「非代理的 UDP」。--proxy-server=socks5 只代理 TCP，WebRTC 的
+        // STUN(UDP) 会绕过它直连，把真实 IP 经 ICE candidate 暴露给页面 JS。
+        // 实测 CI 上 HTTP 出口 IP 为 190.5.208.24，而 srflx candidate 泄漏 runner 真实 IP
+        // 134.33.77.212，CF 判定两者不一致因而拒绝 invisible 放行（本机走 TUN、UDP 也一并
+        // 代理，故无此问题，这也是本机能过早盾的原因）。
+        // 注意开关名不带 force- 前缀：Chrome 155 二进制中不存在 force-webrtc-ip-handling-policy，
+        // 写错会被静默忽略。
+        '--webrtc-ip-handling-policy=disable_non_proxied_udp',
     ];
     if (IS_PROXY) args.push(`--proxy-server=${PROXY_SERVER}`);
 
