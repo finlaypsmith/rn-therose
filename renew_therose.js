@@ -24,6 +24,14 @@
 
 const { connect } = require('puppeteer-real-browser');
 
+// 时区修正（必须早于浏览器启动，子进程要继承到）：
+// GitHub Actions runner 的默认时区是 UTC，而 CF 会把 UTC 视为数据中心/自动化特征，
+// 拒绝 Turnstile invisible 放行。实测本机 TZ=UTC 可稳定复现 CI 的失败（两轮均无 token），
+// 换回正常时区即 13 秒通过 —— 真人浏览器的时区几乎不会是 UTC。
+// 取与代理出口 IP（190.5.208.24，巴西 Recife）地理一致的时区。
+// 用独立的 RENEW_TZ 覆盖，不读系统 TZ：CI 上系统 TZ 恰恰就是出问题的 UTC。
+process.env.TZ = process.env.RENEW_TZ || 'America/Sao_Paulo';
+
 const EMAIL = process.env.EMAIL || '';
 const PASSWORD = process.env.PASSWORD || '';
 const IS_PROXY = (process.env.IS_PROXY || 'false').toLowerCase() === 'true';
