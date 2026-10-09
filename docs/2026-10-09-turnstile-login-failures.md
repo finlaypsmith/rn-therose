@@ -240,12 +240,27 @@ $ TZ=UTC xvfb-run -a node …verify-login.js
 | 修复前 | 3 轮 × 90s 超时 | 3 轮 × 90s 超时 |
 | 只修根因一 | 11–14s 通过 | 3 轮 × 90s 仍超时 |
 | 修根因一 + 二 | 15s 通过，`candidates: []` | 仍超时，`candidates: []` |
-| 修根因一 + 二 + 三 | 通过（含 `TZ=UTC` 模拟） | **待复核** |
+| 修根因一 + 二 + 三 | 通过（含 `TZ=UTC` 模拟） | **15s 过盾、登录成功** |
 
 另有一条附带的排除性证据：加 WebRTC 策略后本机 WebRTC 完全不可用（0 个 candidate），
 **登录依然成功**——说明「WebRTC 无 candidate」不会反过来被 CF 判死，否则本机就会立刻失败。
 
-**CI 侧尚待复核**：最后一次 `workflow_dispatch` 需再跑一次确认。
+### CI 实跑复核
+
+`workflow_dispatch`（2026-10-09）已跑通，登录阶段从此前的 3 轮 × 90s 超时变为 15 秒过盾：
+
+```
+[04:42:54] 🌐 打开登录页面...
+[04:43:09] ✅ Turnstile token 已就绪（长度 794）
+[04:43:15] ✅ 登录成功，已跳转: https://client.therose.cloud/panel
+[04:43:20] 🕒 续期前 Valid until: 2026-10-09 19:38
+[04:43:26] ⏳ 未到续期时间: Renewal is available only within 30 minutes before expiration.
+[04:43:41] 🏁 脚本执行完毕
+```
+
+后续流程（My servers → Extend → Order now → 结果检查）正常走完。续期本身返回 `not_due`
+——站点要求到期前 30 分钟内才可续期，属业务限制，脚本按设计给出 `⏳ 未到续期时间`
+而非误报为失败。
 
 ## 遗留与后续
 
@@ -262,6 +277,11 @@ $ TZ=UTC xvfb-run -a node …verify-login.js
    `Asia/Hong_Kong` 也能过），但这属于未验证的边界，不宜依赖。
 5. **CF 判定会变**：三个根因都是多信号综合判定的结果，CF 侧规则也随时可能调整。再出
    问题时先跑失败诊断（环境 + WebRTC）拿数据，不要直接改代码猜。
+6. **服务器状态识别未匹配**：CI 实跑时状态诊断输出
+   `{"offline":false,"running":false,"canStart":false,"stopReady":false,"stopDisabled":false}`
+   —— 四个状态全部落空，脚本据此判为「未检测到停止状态，无需启动」而跳过启动检查。该
+   判定本身是保守的（不误操作），但四种状态同时不匹配，说明识别逻辑没对上页面实际状态，
+   值得单独确认一次。
 
 ## 参考
 
