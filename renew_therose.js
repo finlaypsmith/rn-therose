@@ -12,7 +12,8 @@
  *   关 cookie 弹窗 → 填凭证 → 等 token（invisible 放行，必要时点击验证框；以
  *   cf-turnstile-response token 非空为唯一权威信号，fail-closed，无 token 不点 Sign in）
  *   → 点 Sign in → 等跳转 /dashboard 并写入 localStorage.trc_token → GET /api/servers →
- *   对 suspended 或进入 30 分钟续期窗口的免费服务器 POST /api/servers/{id}/renew →
+ *   对 suspended 或进入 30 分钟续期窗口的免费服务器，点击卡片上的
+ *   data-testid="renew-<id>" 按钮（失败回退 POST /api/servers/{id}/renew）→
  *   复核 expires_at → TG 通知 + 截图。
  *
  * 说明：旧的 client.therose.cloud 面板（cart_renew / Order now / SSO Manage server）已废弃，
@@ -650,7 +651,30 @@ function fmtTime(ms) {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-// 续期：主站 dashboard 的 "Renew for another <interval>" → POST /api/servers/{id}/renew。
+// 点击 dashboard 卡片上的续期按钮：<button data-testid="renew-<serverId>">
+// 返回 { ok, detail }。按钮未出现/被禁用时返回 ok=false，由调用方决定回退 API。
+async function clickRenewButton(page, serverId) {
+    const sel = `[data-testid="renew-${serverId}"]`;
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+        const state = await page.evaluate((s) => {
+            const b = document.querySelector(s);
+            if (!b) return 'missing';
+            const r = b.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return 'hidden';
+            if (b.disabled) return 'disabled';
+            b.click();
+            return 'clicked';
+        }, sel).catch(() => 'error');
+        if (state === 'clicked') return { ok: true, detail: '' };
+        if (state === 'disabled') return { ok: false, detail: '按钮处于 disabled（可能已在处理中）' };
+        await sleep(500);
+    }
+    return { ok: false, detail: '未找到可点击的续期按钮' };
+}
+
+// 续期：主站 dashboard 的 "↻ Renew and restore for another 12 hours"。优先点击真实按钮，
+// 按钮不可用时回退到按钮背后的同名接口 POST /api/servers/{id}/renew。
 // 判定与前端一致：免费服务器处于 suspended，或距离 expires_at 不足续期窗口。
 async function renew(page) {
     log('📂 打开 dashboard...');
@@ -660,7 +684,8 @@ async function renew(page) {
     const windowMinutes = await fetchRenewWindowMinutes(page);
     const windowMs = windowMinutes * 60 * 1000;
     const servers = await listServers(page);
-    const free = servers.filter((s) => s.is_free && s.status !== 'cancelled');
+    // 与前端 m 列表同款过滤：排除 cancelled，以及 expired 且没有面板 ID（已彻底释放）的
+    const free = servers.filter((s) => s.is_free && s.status !== 'cancelled' && !(s.status === 'expired' && !s.pterodactyl_server_id));
     log(`📋 服务器 ${servers.length} 台（免费 ${free.length} 台），续期窗口 ${windowMinutes} 分钟`);
 
     const now = Date.now();
@@ -686,15 +711,21 @@ async function renew(page) {
     const problems = [];
     for (const s of eligible) {
         const before = expiresAtMs(s);
-        const r = await apiFetch(page, `/servers/${s.id}/renew`, { method: 'POST' });
-        if (r.status !== 200) {
-            const detail = (r.body && r.body.detail) || r.error || `HTTP ${r.status}`;
-            problems.push(`${serverLabel(s)}: ${detail}`);
-            log(`❌ ${serverLabel(s)} 续期失败: ${detail}`);
-            continue;
+        const click = await clickRenewButton(page, s.id);
+        if (!click.ok) {
+            log(`⚠️ ${serverLabel(s)} ${click.detail}，回退调用续期接口...`);
+            const r = await apiFetch(page, `/servers/${s.id}/renew`, { method: 'POST' });
+            if (r.status !== 200) {
+                const detail = (r.body && r.body.detail) || r.error || `HTTP ${r.status}`;
+                problems.push(`${serverLabel(s)}: ${detail}`);
+                log(`❌ ${serverLabel(s)} 续期失败: ${detail}`);
+                continue;
+            }
+        } else {
+            log(`🖱️ 已点击 ${serverLabel(s)} 的续期按钮`);
         }
         done.push({ id: s.id, label: serverLabel(s), before });
-        log(`✅ ${serverLabel(s)} 续期接口已返回`);
+        log(`✅ ${serverLabel(s)} 续期请求已提交`);
     }
 
     // 复核：重新拉列表，确认 expires_at 变长（后端可能有几秒延迟，最多等 8 秒）
