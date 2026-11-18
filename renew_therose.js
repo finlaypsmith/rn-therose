@@ -112,17 +112,21 @@ function getEgressInfo(proxyServer = '') {
 
 // 浏览器时区与出口 IP 对齐：在 Chrome 启动前写 TZ，子进程会继承。
 // RENEW_TZ 显式指定时跳过查询（保留手动覆盖能力）。
+let egressTimezone = '';
 function applyEgressTimezone() {
     if (process.env.RENEW_TZ) {
         process.env.TZ = process.env.RENEW_TZ;
+        egressTimezone = process.env.TZ;
         log(`🕒 使用 RENEW_TZ=${process.env.TZ}`);
         return;
     }
     const { ip, tz } = getEgressInfo(IS_PROXY ? PROXY_SERVER : '');
     if (tz) {
         process.env.TZ = tz;
+        egressTimezone = tz;
         log(`📍 出口IP: ${ip}，时区: ${tz}（与出口一致）`);
     } else {
+        egressTimezone = process.env.TZ;
         log(`⚠️ 未获取到出口时区（出口IP: ${ip || '未知'}），沿用 ${process.env.TZ}`);
     }
 }
@@ -152,6 +156,14 @@ async function sendTelegram(message) {
     } catch (e) {
         log(`❌ TG 推送异常: ${e.message}`);
     }
+}
+
+// 出口 IP 与时区单独一行展示（时区取 applyEgressTimezone 解析结果）
+function egressLine(ip) {
+    const parts = [];
+    if (ip) parts.push(`🌐 出口IP: ${ip}`);
+    if (egressTimezone) parts.push(`🕒 时区: ${egressTimezone}`);
+    return parts.join(' · ');
 }
 
 // 与旧 Python 版 format_notification 逐行一致的通知文案
@@ -1023,7 +1035,7 @@ async function main() {
         await login(page);
     } catch (e) {
         log(`❌ 登录失败: ${e.message}`);
-        const extra = egressIp ? `🌐 出口IP: ${egressIp}` : '';
+        const extra = egressLine(egressIp);
         await sendTelegram(formatNotification('❌ 登录失败', extra, e.message));
         try { await browser.close(); } catch (x) {}
         return;
@@ -1050,8 +1062,8 @@ async function main() {
         const extra = [
             renewalText,
             startText,
-            egressIp ? `🌐 出口IP: ${egressIp}` : '',
-        ].filter(Boolean).join(' | ');
+            egressLine(egressIp),
+        ].filter(Boolean).join('\n');
         if (r.ok) {
             await sendTelegram(formatNotification('✅ 续期成功', extra));
         } else if (r.status === 'not_due') {
