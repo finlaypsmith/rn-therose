@@ -8,10 +8,15 @@
  * 注意：puppeteer-real-browser 内置的自动求解器（turnstile:true）在本站登录页会误点
  * Sign in 按钮、导致页面反复重导航，已关闭 —— 原因见 launchRealBrowser() 的注释。
  *
- * 流程：启动过盾浏览器（挂代理）→ 出口 IP 自检 → 打开登录页 → 关 cookie 弹窗 →
- *   填凭证 → 轮询 cf-turnstile-response token 非空为唯一权威信号（fail-closed，无 token 不点 Sign in）
- *   → 点 Sign in → 提交后再判一次是否又冒 Turnstile → 轮询跳转 /panel|/dashboard → 登录成功
- *   → 点 Extend → 点 Order now → 检查成功提示 → TG 通知 + 截图。
+ * 流程：启动过盾浏览器（挂代理）→ 出口 IP 自检 → 打开 https://therose.cloud/login →
+ *   关 cookie 弹窗 → 填凭证 → 轮询 cf-turnstile-response token 非空为唯一权威信号
+ *   （fail-closed，无 token 不点 Sign in）→ 点 Sign in → 等跳转 /dashboard 并写入
+ *   localStorage.trc_token → GET /api/servers → 对 suspended 或进入 30 分钟续期窗口的
+ *   免费服务器 POST /api/servers/{id}/renew → 复核 expires_at → TG 通知 + 截图。
+ *
+ * 说明：旧的 client.therose.cloud 面板（cart_renew / Order now / SSO Manage server）已废弃，
+ * 续期入口迁移到主站 dashboard 的 "Renew for another Xh"。主站登录是 React 受控表单
+ * （data-testid=login-email/login-password/login-submit），鉴权为 JWT（Bearer）。
  *
  * 环境变量（沿用旧 Python 版，无需改 Secrets）：
  *   EMAIL            登录邮箱
@@ -40,7 +45,11 @@ const PROXY_SERVER = (process.env.PROXY_SERVER || '').trim() || 'socks5://127.0.
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 
-const BASE_URL = 'https://client.therose.cloud/login';
+const SITE_URL = 'https://therose.cloud';
+const BASE_URL = `${SITE_URL}/login`;
+const DASHBOARD_URL = `${SITE_URL}/dashboard`;
+const API_BASE = '/api';
+const DEFAULT_RENEW_WINDOW_MINUTES = 30;
 
 // 掩码邮箱（只用于通知展示，脱敏）—— 与旧 Python 版 mask_email 等价
 function maskEmail(email) {
@@ -229,52 +238,50 @@ async function waitTurnstileToken(page, timeoutS = 60) {
     return false;
 }
 
-// 关 cookie 同意弹窗（沿用 g4 evaluate 写法，消除遮挡）
+// 关 cookie 同意弹窗（主站是 React 渲染的 "Reject all / Accept all"）
 async function dismissCookieConsent(page) {
     try {
         await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button, span, a'));
-            const b = btns.find((el) => {
-                const t = (el.textContent || '').trim().toLowerCase();
-                return t === 'consent' || t === 'accept' || t === 'i agree' || t.includes('recommended cookies');
-            });
+            const btns = Array.from(document.querySelectorAll('button'));
+            const b = btns.find((el) => /^(reject all|accept all)$/i.test((el.textContent || '').trim()));
             if (b) b.click();
         });
     } catch (e) { /* 忽略 */ }
 }
 
-// 填邮箱/密码：优先 evaluate 直接写值（比 type 更抗 CF 重渲染），失败再回退 type
+// 填邮箱/密码：主站是 React 受控输入，直接改 value 不会触发 onChange，
+// 必须走原生 setter + input/change 事件；失败再回退 page.type
 async function fillCredentials(page) {
     log('📧 填写邮箱...');
-    await page.waitForSelector('#login_form_email', { timeout: 15000 });
-    await page.waitForSelector('#login_form_password', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="login-email"]', { timeout: 15000 });
+    await page.waitForSelector('[data-testid="login-password"]', { timeout: 15000 });
 
     const written = await page.evaluate((email, password) => {
-        const e = document.querySelector('#login_form_email');
-        const p = document.querySelector('#login_form_password');
+        const setVal = (el, v) => {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(el, v);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        };
+        const e = document.querySelector('[data-testid="login-email"]');
+        const p = document.querySelector('[data-testid="login-password"]');
         if (!e || !p) return { ok: false, reason: 'missing-fields' };
         e.focus();
-        e.value = '';
-        e.value = email;
-        e.dispatchEvent(new Event('input', { bubbles: true }));
-        e.dispatchEvent(new Event('change', { bubbles: true }));
+        setVal(e, email);
         p.focus();
-        p.value = '';
-        p.value = password;
-        p.dispatchEvent(new Event('input', { bubbles: true }));
-        p.dispatchEvent(new Event('change', { bubbles: true }));
+        setVal(p, password);
         return { ok: true, emailVal: e.value || '' };
     }, EMAIL, PASSWORD);
 
     if (!written || !written.ok || written.emailVal !== EMAIL) {
         log('⚠️ evaluate 写入异常，回退 page.type');
         try {
-            await page.click('#login_form_email', { clickCount: 3 });
+            await page.click('[data-testid="login-email"]', { clickCount: 3 });
             await page.keyboard.press('Backspace');
-            await page.type('#login_form_email', EMAIL, { delay: 20 });
-            await page.click('#login_form_password', { clickCount: 3 });
+            await page.type('[data-testid="login-email"]', EMAIL, { delay: 20 });
+            await page.click('[data-testid="login-password"]', { clickCount: 3 });
             await page.keyboard.press('Backspace');
-            await page.type('#login_form_password', PASSWORD, { delay: 20 });
+            await page.type('[data-testid="login-password"]', PASSWORD, { delay: 20 });
         } catch (e) {
             throw new Error(`填写凭证失败: ${e.message}`);
         }
@@ -284,26 +291,31 @@ async function fillCredentials(page) {
     await sleep(400);
 }
 
-// 为 fail-closed 诊断采集登录页 DOM 状态
+// 为 fail-closed 诊断采集登录页 DOM 状态（主站错误提示是 .trc-error / [data-testid=login-error]）
 async function diagnosePage(page) {
     try {
         return await page.evaluate(() => {
-            const errSel = ['.alert-danger', '.alert.alert-danger', 'div[role="alert"]', '.invalid-feedback', '.form-error', '.error-message', 'div.alert'];
+            const errSel = ['[data-testid="login-error"]', '.trc-error', '[role="alert"]'];
             let errText = '';
             for (const s of errSel) {
-                const el = document.querySelector(s);
-                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
-                    errText = (el.textContent || '').trim();
-                    if (errText) break;
+                for (const el of Array.from(document.querySelectorAll(s))) {
+                    if (el.offsetParent !== null || getComputedStyle(el).display !== 'none') {
+                        errText = (el.textContent || '').trim();
+                        if (errText) break;
+                    }
                 }
+                if (errText) break;
             }
             const tEl = document.querySelector('[name="cf-turnstile-response"]');
-            const cf = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], .cf-turnstile');
+            const cf = document.querySelector('.trc-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+            let hasAuthToken = false;
+            try { hasAuthToken = !!localStorage.getItem('trc_token'); } catch (e) {}
             return {
                 url: location.href,
                 title: document.title,
-                hasCfIframe: !!cf,
+                hasCfWidget: !!cf,
                 tokenLen: tEl && tEl.value ? tEl.value.length : 0,
+                hasAuthToken,
                 errText: errText.slice(0, 300),
             };
         });
@@ -358,13 +370,19 @@ async function probeWebRtc(page) {
     }
 }
 
-// 登录流程：过盾 → fail-closed → 点 Sign in → 等跳 /panel|/dashboard
+// 登录流程：过盾 → fail-closed → 点 Sign in → 等 /dashboard + localStorage.trc_token
 async function login(page) {
-    log('🌐 打开登录页面...');
+    log('🌐 打开主站登录页...');
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await humanWait(2, 4);
     // 若被 CF 拦到 challenge 中间页，CF 会自行 invisible 放行；给一点缓冲
     await dismissCookieConsent(page);
+    // 轻微的人类交互，帮助 CF 的被动检测（无 token 时不必走到这里）
+    await page.bringToFront();
+    for (let i = 0; i < 5; i++) {
+        await page.mouse.move(420 + i * 35, 380 + i * 12, { steps: 6 });
+        await sleep(250);
+    }
 
     let tokenOk = false;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -399,46 +417,28 @@ async function login(page) {
     await fillCredentials(page);
 
     log('🖱️ 点击 Sign in...');
-    try {
-        await page.evaluate(() => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            const b = btns.find((el) => (el.textContent || '').trim().toLowerCase() === 'sign in');
-            if (b) b.click();
-            else throw new Error('未找到 Sign in 按钮');
-        });
-    } catch (e) {
-        // JS click 兜底
-        await page.evaluate(() => {
-            const b = document.querySelector('button');
-            if (b) b.click();
-        });
+    // 登录按钮在 token 就绪前是 disabled，等它解除后再点
+    let clicked = false;
+    for (let i = 0; i < 10 && !clicked; i++) {
+        clicked = await page.evaluate(() => {
+            const b = document.querySelector('[data-testid="login-submit"]');
+            if (b && !b.disabled) { b.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (!clicked) await sleep(1000);
     }
-    await humanWait(4, 7);
-
-    // 提交后若又冒 Turnstile，再等一次 token
-    const tokenAfter = await getTurnstileToken(page);
-    if (!tokenAfter) {
-        const cfStill = await page.evaluate(() => !!(document.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile')));
-        if (cfStill) {
-            log('🛡 提交后再冒 Turnstile，继续等 token...');
-            await waitTurnstileToken(page, 25);
-            await sleep(1500);
-        }
-    }
+    await humanWait(3, 5);
 
     for (let i = 0; i < 30; i++) {
-        const url = page.url();
-        if (url.includes('/panel') || url.includes('/dashboard')) {
-            log(`✅ 登录成功，已跳转: ${url}`);
-            return url;
+        const diag = await diagnosePage(page);
+        if (diag.hasAuthToken && /\/dashboard/.test(page.url())) {
+            log(`✅ 登录成功，已跳转: ${page.url()}`);
+            return page.url();
         }
-        if (i > 0 && i % 5 === 0) {
-            const diag = await diagnosePage(page);
-            if (diag.errText && /invalid|incorrect|wrong|错误|失败/i.test(diag.errText)) {
-                log(`❌ 检测到登录错误: ${diag.errText}`);
-                try { await page.screenshot({ path: 'artifacts/login_error.png' }); } catch (e) {}
-                throw new Error(`登录被拒: ${diag.errText || '未知错误'} | ${url}`);
-            }
+        if (diag.errText && /invalid|incorrect|wrong|failed|security check|错误|失败/i.test(diag.errText)) {
+            log(`❌ 检测到登录错误: ${diag.errText}`);
+            try { await page.screenshot({ path: 'artifacts/login_error.png' }); } catch (e) {}
+            throw new Error(`登录被拒: ${diag.errText}`);
         }
         await sleep(1000);
     }
@@ -447,293 +447,150 @@ async function login(page) {
     throw new Error(`登录超时未跳转 Dashboard | ${diag.url || ''} | ${diag.errText || ''}`);
 }
 
-// 读取 My servers 页的 Valid until 时间文本
-async function readValidUntil(page) {
-    return await page.evaluate(() => {
-        const body = document.body ? document.body.innerText : '';
-        // "Valid until\n2026-07-23 21:27" 或同一行
-        const m = body.match(/Valid until\s*[\n\r\t ]*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/i);
-        return m ? m[1].trim() : '';
-    });
+// 在主站页面上下文里调 API：页面里的 axios 拦截器就是用 localStorage.trc_token 加 Bearer
+async function apiFetch(page, path, options = {}) {
+    return await page.evaluate(async (p, opt) => {
+        const token = localStorage.getItem('trc_token') || '';
+        const headers = Object.assign({}, opt.headers || {});
+        if (token) headers.Authorization = 'Bearer ' + token;
+        if (opt.body !== undefined && opt.body !== null) headers['Content-Type'] = 'application/json';
+        try {
+            const res = await fetch(p, {
+                method: opt.method || 'GET',
+                headers,
+                body: opt.body === undefined || opt.body === null ? undefined : JSON.stringify(opt.body),
+            });
+            const raw = await res.text();
+            let body = raw;
+            try { body = raw ? JSON.parse(raw) : null; } catch (e) { body = raw.slice(0, 300); }
+            return { status: res.status, body };
+        } catch (e) {
+            return { status: 0, body: null, error: e.message };
+        }
+    }, `${API_BASE}${path}`, options);
 }
 
-// 检查续期结果：优先读成功/失败 alert，再比对 Valid until
-async function checkRenewalSuccess(page, validBefore = '') {
-    log('🔍 等待检查续期结果...');
-    // 给跳转/渲染一点时间
-    for (let i = 0; i < 12; i++) {
-        await sleep(1000);
-        const hit = await page.evaluate(() => {
-            // 失败 alert 优先
-            const dangerSels = ['.alert-danger', '.alert.alert-danger', 'div[role="alert"].alert-danger'];
-            for (const s of dangerSels) {
-                const el = document.querySelector(s);
-                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
-                    const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
-                    if (!txt) continue;
-                    if (/renewal is available only|within \d+ minutes before expiration/i.test(txt)) {
-                        return { kind: 'not_due', text: txt };
-                    }
-                    return { kind: 'error', text: txt };
-                }
-            }
-            const sels = ['.alert-success', '.alert.alert-success', 'div[role="alert"].alert-success', 'div.alert-success'];
-            for (const s of sels) {
-                const el = document.querySelector(s);
-                if (el && (el.offsetParent !== null || getComputedStyle(el).display !== 'none')) {
-                    const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
-                    if (txt) return { kind: 'ok', text: txt };
-                }
-            }
-            const body = document.body ? document.body.innerText : '';
-            if (/successfully purchased/i.test(body)) return { kind: 'ok', text: 'successfully purchased' };
-            if (/order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i.test(body)) {
-                return { kind: 'ok', text: body.match(/successfully purchased|order (has been )?completed|payment successful|server (has been )?extended|renewed successfully/i)?.[0] || 'order completed' };
-            }
-            // 未到续期窗口：这是站点业务限制，不是脚本失败
-            if (/renewal is available only|within \d+ minutes before expiration/i.test(body)) {
-                const m = body.match(/Renewal is available only[^\n]+|Error during creating the server:\s*Renewal is available only[^\n]+/i);
-                return { kind: 'not_due', text: (m && m[0] || '未到续期时间：仅到期前 30 分钟可续期').trim() };
-            }
-            // 其他业务拒绝文案才视为续期失败
-            if (/insufficient|not enough|error during/i.test(body)) {
-                const m = body.match(/Error during[^\n]+|insufficient[^\n]+|not enough[^\n]+/i);
-                return { kind: 'error', text: (m && m[0] || '续期被服务器拒绝').trim() };
-            }
-            return null;
-        });
-        if (hit) {
-            if (hit.kind === 'error') return { ok: false, status: 'failed', text: hit.text };
-            if (hit.kind === 'not_due') return { ok: false, status: 'not_due', text: hit.text };
-            return { ok: true, status: 'success', text: hit.text };
-        }
-    }
-
-    // 回 My servers 比对 Valid until 是否变长
-    try {
-        await page.goto('https://client.therose.cloud/panel?routeName=servers', {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-        });
-        await sleep(2000);
-        const validAfter = await readValidUntil(page);
-        if (validAfter && validBefore && validAfter !== validBefore) {
-            return { ok: true, status: 'success', text: `Valid until ${validBefore} → ${validAfter}` };
-        }
-        if (validAfter && !validBefore) {
-            return { ok: true, status: 'success', text: `Valid until ${validAfter}` };
-        }
-        return {
-            ok: false,
-            status: 'failed',
-            text: `Valid until 未增加（前: ${validBefore || '未知'} / 后: ${validAfter || '未知'}）`,
-        };
-    } catch (e) {
-        return { ok: false, status: 'failed', text: `结果页检查异常: ${e.message}` };
-    }
+// 续期窗口（分钟）：主站 /api/settings/public 暴露 renew_window_minutes，默认 30
+async function fetchRenewWindowMinutes(page) {
+    const r = await apiFetch(page, '/settings/public');
+    const n = r.status === 200 && r.body ? Number(r.body.renew_window_minutes) : 0;
+    return n > 0 ? n : DEFAULT_RENEW_WINDOW_MINUTES;
 }
 
-// 登录后续期：
-// Dashboard 没有 Extend；真正入口在 My servers 页的 a[href*="cart_renew"]
-// → cart_renew 页 #order-submit (Order now) → 检查成功提示 / Valid until 变化
+// GET /api/servers：dashboard 渲染用的同一份数据
+async function listServers(page) {
+    const r = await apiFetch(page, '/servers');
+    if (r.status !== 200 || !Array.isArray(r.body)) {
+        throw new Error(`读取服务器列表失败: HTTP ${r.status} ${JSON.stringify(r.body || r.error || '').slice(0, 200)}`);
+    }
+    return r.body;
+}
+
+function expiresAtMs(server) {
+    const t = server && server.expires_at ? new Date(server.expires_at).getTime() : 0;
+    return Number.isFinite(t) ? t : 0;
+}
+
+function serverLabel(server) {
+    const name = server.name || `#${server.id}`;
+    return server.pterodactyl_identifier ? `${name} #${server.pterodactyl_identifier}` : name;
+}
+
+function fmtTime(ms) {
+    if (!ms) return '未知';
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// 续期：主站 dashboard 的 "Renew for another <interval>" → POST /api/servers/{id}/renew。
+// 判定与前端一致：免费服务器处于 suspended，或距离 expires_at 不足续期窗口。
 async function renew(page) {
-    log('📂 进入 My servers...');
-    await page.goto('https://client.therose.cloud/panel?routeName=servers', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-    });
+    log('📂 打开 dashboard...');
+    await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => log(`⚠️ 打开 dashboard 失败: ${e.message}`));
     await humanWait(2, 4);
 
-    const validBefore = await readValidUntil(page);
-    log(`🕒 续期前 Valid until: ${validBefore || '未知'}`);
+    const windowMinutes = await fetchRenewWindowMinutes(page);
+    const windowMs = windowMinutes * 60 * 1000;
+    const servers = await listServers(page);
+    const free = servers.filter((s) => s.is_free && s.status !== 'cancelled');
+    log(`📋 服务器 ${servers.length} 台（免费 ${free.length} 台），续期窗口 ${windowMinutes} 分钟`);
 
-    // 优先点 cart_renew 链接，文本 Extend 兜底
-    log('🖱️ 点击 Extend...');
-    const extendHref = await page.evaluate(() => {
-        const byHref = document.querySelector('a[href*="cart_renew"]');
-        if (byHref) {
-            const href = byHref.getAttribute('href') || '';
-            byHref.click();
-            return href;
-        }
-        const all = Array.from(document.querySelectorAll('a, button, span, [role="button"]'));
-        const byText = all.find((el) => {
-            const t = (el.textContent || el.getAttribute('title') || '').trim().toLowerCase();
-            return t === 'extend' || t.includes('extend');
-        });
-        if (byText) {
-            byText.click();
-            return byText.getAttribute('href') || 'clicked-by-text';
-        }
-        return '';
+    const now = Date.now();
+    const eligible = free.filter((s) => {
+        const exp = expiresAtMs(s);
+        return s.status === 'suspended' || (exp > 0 && exp - now <= windowMs);
     });
-    if (!extendHref) {
-        try { await page.screenshot({ path: 'artifacts/no_extend.png', fullPage: true }); } catch (e) {}
-        throw new Error('未找到 Extend 按钮（My servers 页无 cart_renew 链接）');
-    }
-    log(`✅ 已点击 Extend（${extendHref}）`);
 
-    // 等进入 cart_renew 或出现 Order now
-    let onCart = false;
-    for (let i = 0; i < 20; i++) {
-        const url = page.url();
-        const hasOrder = await page.evaluate(() => {
-            if (document.querySelector('#order-submit')) return true;
-            return Array.from(document.querySelectorAll('button, a')).some(
-                (el) => /order now/i.test((el.textContent || '').trim())
-            );
-        }).catch(() => false);
-        if (url.includes('cart_renew') || hasOrder) {
-            onCart = true;
-            break;
-        }
-        await sleep(500);
-    }
-    if (!onCart && extendHref.startsWith('/')) {
-        // click 可能没导航成功，直接 goto
-        await page.goto(`https://client.therose.cloud${extendHref}`, {
-            waitUntil: 'domcontentloaded',
-            timeout: 60000,
-        });
-        await humanWait(2, 3);
-    } else {
-        await humanWait(1, 2);
-    }
-
-    log('🛒 点击 Order now...');
-    const ordered = await page.evaluate(() => {
-        const byId = document.querySelector('#order-submit');
-        if (byId) { byId.click(); return true; }
-        const btns = Array.from(document.querySelectorAll('button, a, input[type="submit"]'));
-        const b = btns.find((el) => /order now/i.test((el.textContent || el.value || '').trim()));
-        if (b) { b.click(); return true; }
-        return false;
-    });
-    if (!ordered) {
-        try { await page.screenshot({ path: 'artifacts/no_order_now.png', fullPage: true }); } catch (e) {}
-        throw new Error('未找到 Order now 按钮');
-    }
-    log('✅ 已点击 Order now');
-
-    // 等导航/响应
-    await sleep(3000);
-
-    const result = await checkRenewalSuccess(page, validBefore);
-    if (result.ok) {
-        log(`✅ 续期成功: ${result.text}`);
-        try { await page.screenshot({ path: 'artifacts/renewal_ok.png', fullPage: true }); } catch (e) {}
-        return { ok: true, status: result.status || 'success', text: result.text };
-    }
-    if (result.status === 'not_due') {
-        log(`⏳ 未到续期时间: ${result.text}`);
+    if (!eligible.length) {
+        const upcoming = free
+            .filter((s) => expiresAtMs(s) > now)
+            .sort((a, b) => expiresAtMs(a) - expiresAtMs(b))[0];
+        const text = upcoming
+            ? `未到续期窗口：${serverLabel(upcoming)} 于 ${fmtTime(expiresAtMs(upcoming))} 到期（窗口 ${windowMinutes} 分钟）`
+            : '没有需要续期的免费服务器';
+        log(`⏳ ${text}`);
         try { await page.screenshot({ path: 'artifacts/renewal_not_due.png', fullPage: true }); } catch (e) {}
-        return { ok: false, status: 'not_due', text: result.text };
-    }
-    log(`❌ 续期可能失败: ${result.text}`);
-    try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
-    return { ok: false, status: result.status || 'failed', text: result.text };
-}
-
-// 从 My servers 找 Manage server 链接并进入面板页（panel.therose.cloud/server/<id>）
-async function openServerManager(page) {
-    log('📂 进入 My servers 检查 Manage server...');
-    await page.goto('https://client.therose.cloud/panel?routeName=servers', {
-        waitUntil: 'domcontentloaded',
-        timeout: 60000,
-    });
-    await humanWait(2, 4);
-
-    const manageHref = await page.evaluate(() => {
-        const byHref = document.querySelector('a[href*="/sso/redirect"][href*="server/"]');
-        if (byHref) return byHref.getAttribute('href') || '';
-        const a = Array.from(document.querySelectorAll('a')).find((el) => {
-            const t = (el.textContent || el.getAttribute('title') || '').trim();
-            return /manage server/i.test(t);
-        });
-        return a ? (a.getAttribute('href') || '') : '';
-    });
-    if (!manageHref) {
-        try { await page.screenshot({ path: 'artifacts/no_manage_server.png', fullPage: true }); } catch (e) {}
-        throw new Error('未找到 Manage server 链接');
+        return { ok: false, status: 'not_due', text };
     }
 
-    const target = manageHref.startsWith('http')
-        ? manageHref
-        : `https://client.therose.cloud${manageHref}`;
-    log(`🧭 进入服务器管理页: ${manageHref}`);
-    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(8000);
-    return page.url();
-}
-
-// 续期后如果服务器是 Offline/Stopped，则进入管理页点击 Start
-async function startServerIfStopped(page) {
-    log('🔎 检查服务器运行状态...');
-    const managerUrl = await openServerManager(page);
-    const state = await page.evaluate(() => {
-        const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-        const buttons = Array.from(document.querySelectorAll('button')).map((b) => ({
-            text: (b.textContent || '').trim(),
-            disabled: !!b.disabled,
-            visible: visible(b),
-        }));
-        const body = document.body ? document.body.innerText : '';
-        const startButton = buttons.find((b) => /^Start$/i.test(b.text) && b.visible && !b.disabled);
-        const stopButton = buttons.find((b) => /^Stop$/i.test(b.text) && b.visible);
-        const stopReady = !!(stopButton && !stopButton.disabled);
-        const offline = /\bOffline\b|\bStopped\b/i.test(body);
-        const running = /\bRunning\b|\bOnline\b/i.test(body) || stopReady;
-        return {
-            offline,
-            running,
-            canStart: !!startButton,
-            stopReady,
-            stopDisabled: !!(stopButton && stopButton.disabled),
-            buttons,
-        };
-    });
-
-    log(`🩺 服务器状态诊断: ${JSON.stringify({ offline: state.offline, running: state.running, canStart: state.canStart, stopReady: state.stopReady, stopDisabled: state.stopDisabled })}`);
-    if (state.running) {
-        return { started: false, needed: false, text: '服务器已在运行或正在启动，无需启动' };
-    }
-    if (!state.offline && !state.canStart && !state.stopDisabled) {
-        return { started: false, needed: false, text: '未检测到停止状态，无需启动' };
-    }
-    if (!state.canStart) {
-        try { await page.screenshot({ path: 'artifacts/server_start_unavailable.png', fullPage: true }); } catch (e) {}
-        throw new Error(`检测到停止状态但 Start 按钮不可用: ${JSON.stringify(state)}`);
-    }
-
-    await page.evaluate(() => {
-        const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-        const b = Array.from(document.querySelectorAll('button')).find(
-            (el) => /^Start$/i.test((el.textContent || '').trim()) && visible(el) && !el.disabled
-        );
-        if (!b) throw new Error('Start 按钮不存在或不可点击');
-        b.click();
-    });
-    log('🚀 已点击 Start，等待服务器启动...');
-
-    for (let i = 0; i < 30; i++) {
-        await sleep(2000);
-        const ok = await page.evaluate(() => {
-            const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-            const stop = Array.from(document.querySelectorAll('button')).find(
-                (el) => /^Stop$/i.test((el.textContent || '').trim()) && visible(el)
-            );
-            const body = document.body ? document.body.innerText : '';
-            return /\bRunning\b|\bOnline\b|\bStarting\b/i.test(body) || !!(stop && !stop.disabled);
-        });
-        if (ok) {
-            try { await page.screenshot({ path: 'artifacts/server_start_ok.png', fullPage: true }); } catch (e) {}
-            return { started: true, needed: true, text: `服务器已自动启动（${managerUrl}）` };
+    log(`🖱️ 续期 ${eligible.length} 台: ${eligible.map(serverLabel).join(', ')}`);
+    const done = [];
+    const problems = [];
+    for (const s of eligible) {
+        const before = expiresAtMs(s);
+        const r = await apiFetch(page, `/servers/${s.id}/renew`, { method: 'POST' });
+        if (r.status !== 200) {
+            const detail = (r.body && r.body.detail) || r.error || `HTTP ${r.status}`;
+            problems.push(`${serverLabel(s)}: ${detail}`);
+            log(`❌ ${serverLabel(s)} 续期失败: ${detail}`);
+            continue;
         }
+        done.push({ id: s.id, label: serverLabel(s), before });
+        log(`✅ ${serverLabel(s)} 续期接口已返回`);
     }
 
-    try { await page.screenshot({ path: 'artifacts/server_start_fail.png', fullPage: true }); } catch (e) {}
-    throw new Error('已点击 Start，但 60 秒内未检测到 Running/Online/Stop 可用');
+    // 复核：重新拉列表，确认 expires_at 变长（后端可能有几秒延迟，最多等 8 秒）
+    let after = [];
+    for (let i = 0; i < 4; i++) {
+        await sleep(2000);
+        after = await listServers(page).catch((e) => { log(`⚠️ 复核列表失败: ${e.message}`); return []; });
+        const map = new Map(after.map((s) => [s.id, s]));
+        const allExtended = done.every((d) => {
+            const s = map.get(d.id);
+            return s && (expiresAtMs(s) > d.before || (s.status === 'active' && expiresAtMs(s) > Date.now()));
+        });
+        if (allExtended) break;
+    }
+    const byId = new Map(after.map((s) => [s.id, s]));
+    const renewed = [];
+    for (const d of done) {
+        const s = byId.get(d.id);
+        if (!s) { problems.push(`${d.label}: 刷新后找不到该服务器`); continue; }
+        const exp = expiresAtMs(s);
+        if (exp > d.before) renewed.push(`${d.label}: ${fmtTime(d.before)} → ${fmtTime(exp)}`);
+        else if (s.status === 'active' && exp > Date.now()) renewed.push(`${d.label}: 到期时间 ${fmtTime(exp)}`);
+        else problems.push(`${d.label}: expires_at 未变化（前 ${fmtTime(d.before)} / 后 ${fmtTime(exp)}）`);
+    }
+
+    if (renewed.length && !problems.length) {
+        const text = `已续期 ${renewed.length} 台｜${renewed.join('；')}`;
+        log(`✅ ${text}`);
+        try { await page.screenshot({ path: 'artifacts/renewal_ok.png', fullPage: true }); } catch (e) {}
+        return { ok: true, status: 'success', text };
+    }
+    if (renewed.length) {
+        const text = `部分成功 ${renewed.length}/${eligible.length}｜${renewed.join('；')}｜失败: ${problems.join('；')}`;
+        log(`⚠️ ${text}`);
+        try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
+        return { ok: false, status: 'failed', text };
+    }
+    const text = `续期失败: ${problems.join('；') || '未知原因'}`;
+    log(`❌ ${text}`);
+    try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
+    return { ok: false, status: 'failed', text };
 }
+
 
 
 async function main() {
@@ -776,21 +633,9 @@ async function main() {
 
     try {
         const r = await renew(page);
-        let startText = '';
-        try {
-            const start = await startServerIfStopped(page);
-            startText = start.text;
-        } catch (startErr) {
-            startText = `服务器启动检查失败: ${startErr.message}`;
-            log(`⚠️ ${startText}`);
-            try { await page.screenshot({ path: 'artifacts/server_start_error.png', fullPage: true }); } catch (x) {}
-        }
-        const renewalText = r.status === 'not_due'
-            ? `⏳ 未到续期时间：仅到期前 30 分钟可续期（${r.text}）`
-            : r.text;
+        const renewalText = r.status === 'not_due' ? `⏳ ${r.text}` : r.text;
         const extra = [
             renewalText,
-            startText,
             egressIp ? `🌐 出口IP: ${egressIp}` : '',
         ].filter(Boolean).join(' | ');
         if (r.ok) {
@@ -798,7 +643,7 @@ async function main() {
         } else if (r.status === 'not_due') {
             await sendTelegram(formatNotification('⏳ 未到续期时间', extra));
         } else {
-            await sendTelegram(formatNotification('❌ 续期可能失败', extra, r.text));
+            await sendTelegram(formatNotification('❌ 续期失败', extra));
         }
     } catch (e) {
         log(`❌ 续期异常: ${e.message}`);
@@ -815,4 +660,4 @@ if (require.main === module) {
 }
 
 // 导出各阶段函数，便于验证脚本直接跑真实流程（不改变 `node renew_therose.js` 的行为）
-module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, main };
+module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, listServers, renew, main };
