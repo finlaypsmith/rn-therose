@@ -14,6 +14,7 @@
  *   → 点 Sign in → 等跳转 /dashboard 并写入 localStorage.trc_token → GET /api/servers →
  *   对 suspended 或进入 30 分钟续期窗口的免费服务器，点击卡片上的
  *   data-testid="renew-<id>" 按钮（失败回退 POST /api/servers/{id}/renew）→
+ *   进入 /server/<id> 详情页：续期按钮可点就续期，状态不是 running 就点 Start →
  *   复核 expires_at → TG 通知 + 截图。
  *
  * 说明：旧的 client.therose.cloud 面板（cart_renew / Order now / SSO Manage server）已废弃，
@@ -673,6 +674,91 @@ async function clickRenewButton(page, serverId) {
     return { ok: false, detail: '未找到可点击的续期按钮' };
 }
 
+const serverDetailUrl = (id) => `${SITE_URL}/server/${id}`;
+
+// 详情页 console 上的状态胶囊（running / offline / starting / installing）
+async function readServerState(page) {
+    return await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="console-status"]');
+        return el ? (el.textContent || '').trim().toLowerCase() : '';
+    }).catch(() => '');
+}
+
+// 详情页上的续期按钮：[data-testid="renew-<id>"]，只有前端认为可续期时才存在/可点
+async function renewOnServerDetail(page, serverId) {
+    const clicked = await page.evaluate((sel) => {
+        const b = document.querySelector(sel);
+        if (!b || b.disabled) return false;
+        const r = b.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        b.click();
+        return true;
+    }, `[data-testid="renew-${serverId}"]`).catch(() => false);
+    if (clicked) await sleep(2000);
+    return clicked;
+}
+
+// 详情页的启动按钮：管理页是 data-testid="start-<id>"，console 空态是 "Start server"
+async function clickStartButton(page, serverId) {
+    return await page.evaluate((id) => {
+        const vis = (el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const txt = (el) => (el.textContent || '').trim().replace(/\s+/g, ' ');
+        const btns = Array.from(document.querySelectorAll('button')).filter(vis);
+        const cand = document.querySelector(`[data-testid="start-${id}"]`)
+            || btns.find((b) => txt(b) === 'Start server' && !b.disabled)
+            || btns.find((b) => txt(b) === 'Start' && !b.disabled);
+        if (!cand || cand.disabled) return false;
+        cand.click();
+        return true;
+    }, serverId).catch(() => false);
+}
+
+// 进入详情页：续期按钮可点就续期；状态不是 running 就点启动并等它起来
+async function ensureServerRunning(page, serverId, label) {
+    log(`🔍 打开详情页: ${label}`);
+    await page.goto(serverDetailUrl(serverId), { waitUntil: 'domcontentloaded', timeout: 60000 })
+        .catch((e) => log(`⚠️ 打开详情页失败: ${e.message}`));
+    await sleep(3000);
+
+    if (await renewOnServerDetail(page, serverId)) {
+        log(`✅ ${label} 详情页续期按钮已点击`);
+        await sleep(2000);
+    }
+
+    // websocket 尚未连通时状态是 connecting/unknown，先等它给出确定值
+    let state = '';
+    for (let i = 0; i < 20; i++) {
+        state = await readServerState(page);
+        if (state && state !== 'connecting' && state !== 'unknown') break;
+        await sleep(1000);
+    }
+
+    if (state === 'running' || state === 'starting' || state === 'installing') {
+        log(`ℹ️ ${label} 状态 ${state}，无需启动`);
+        return { ok: true, state };
+    }
+
+    log(`▶️ ${label} 状态 ${state || '未知'}，点击启动...`);
+    if (!(await clickStartButton(page, serverId))) {
+        log(`⚠️ ${label} 未找到可点击的启动按钮`);
+        return { ok: false, state };
+    }
+    for (let i = 0; i < 45; i++) {
+        await sleep(2000);
+        const s = await readServerState(page);
+        if (s === 'running') {
+            log(`✅ ${label} 已启动`);
+            return { ok: true, state: s };
+        }
+        if (s && s !== state) {
+            log(`⏳ ${label} 状态: ${s}`);
+            state = s;
+        }
+    }
+    log(`⚠️ ${label} 启动后 90 秒仍未进入 running（当前 ${state || '未知'}）`);
+    return { ok: false, state };
+}
+
 // 续期：主站 dashboard 的 "↻ Renew and restore for another 12 hours"。优先点击真实按钮，
 // 按钮不可用时回退到按钮背后的同名接口 POST /api/servers/{id}/renew。
 // 判定与前端一致：免费服务器处于 suspended，或距离 expires_at 不足续期窗口。
@@ -703,7 +789,7 @@ async function renew(page) {
             : '没有需要续期的免费服务器';
         log(`⏳ ${text}`);
         try { await page.screenshot({ path: 'artifacts/renewal_not_due.png', fullPage: true }); } catch (e) {}
-        return { ok: false, status: 'not_due', text };
+        return { ok: false, status: 'not_due', text, servers: [] };
     }
 
     log(`🖱️ 续期 ${eligible.length} 台: ${eligible.map(serverLabel).join(', ')}`);
@@ -742,31 +828,38 @@ async function renew(page) {
     }
     const byId = new Map(after.map((s) => [s.id, s]));
     const renewed = [];
+    const renewedServers = [];
     for (const d of done) {
         const s = byId.get(d.id);
         if (!s) { problems.push(`${d.label}: 刷新后找不到该服务器`); continue; }
         const exp = expiresAtMs(s);
-        if (exp > d.before) renewed.push(`${d.label}: ${fmtTime(d.before)} → ${fmtTime(exp)}`);
-        else if (s.status === 'active' && exp > Date.now()) renewed.push(`${d.label}: 到期时间 ${fmtTime(exp)}`);
-        else problems.push(`${d.label}: expires_at 未变化（前 ${fmtTime(d.before)} / 后 ${fmtTime(exp)}）`);
+        if (exp > d.before) {
+            renewed.push(`${d.label}: ${fmtTime(d.before)} → ${fmtTime(exp)}`);
+            renewedServers.push({ id: d.id, label: d.label });
+        } else if (s.status === 'active' && exp > Date.now()) {
+            renewed.push(`${d.label}: 到期时间 ${fmtTime(exp)}`);
+            renewedServers.push({ id: d.id, label: d.label });
+        } else {
+            problems.push(`${d.label}: expires_at 未变化（前 ${fmtTime(d.before)} / 后 ${fmtTime(exp)}）`);
+        }
     }
 
     if (renewed.length && !problems.length) {
         const text = `已续期 ${renewed.length} 台｜${renewed.join('；')}`;
         log(`✅ ${text}`);
         try { await page.screenshot({ path: 'artifacts/renewal_ok.png', fullPage: true }); } catch (e) {}
-        return { ok: true, status: 'success', text };
+        return { ok: true, status: 'success', text, servers: renewedServers };
     }
     if (renewed.length) {
         const text = `部分成功 ${renewed.length}/${eligible.length}｜${renewed.join('；')}｜失败: ${problems.join('；')}`;
         log(`⚠️ ${text}`);
         try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
-        return { ok: false, status: 'failed', text };
+        return { ok: false, status: 'failed', text, servers: renewedServers };
     }
     const text = `续期失败: ${problems.join('；') || '未知原因'}`;
     log(`❌ ${text}`);
     try { await page.screenshot({ path: 'artifacts/renewal_fail.png', fullPage: true }); } catch (e) {}
-    return { ok: false, status: 'failed', text };
+    return { ok: false, status: 'failed', text, servers: [] };
 }
 
 
@@ -812,8 +905,24 @@ async function main() {
     try {
         const r = await renew(page);
         const renewalText = r.status === 'not_due' ? `⏳ ${r.text}` : r.text;
+
+        // 续期恢复后进入详情页：续期按钮可点就续期，不是 running 就点启动
+        let startText = '';
+        if (r.servers && r.servers.length) {
+            const started = [];
+            const startFailed = [];
+            for (const s of r.servers) {
+                const st = await ensureServerRunning(page, s.id, s.label);
+                if (st.ok) started.push(`${s.label}（${st.state}）`);
+                else startFailed.push(`${s.label}（${st.state || '未知'}）`);
+            }
+            if (started.length) startText = `🟢 运行状态: ${started.join('、')}`;
+            if (startFailed.length) startText = `${startText ? `${startText} | ` : ''}⚠️ 未能启动: ${startFailed.join('、')}`;
+        }
+
         const extra = [
             renewalText,
+            startText,
             egressIp ? `🌐 出口IP: ${egressIp}` : '',
         ].filter(Boolean).join(' | ');
         if (r.ok) {
@@ -838,4 +947,4 @@ if (require.main === module) {
 }
 
 // 导出各阶段函数，便于验证脚本直接跑真实流程（不改变 `node renew_therose.js` 的行为）
-module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, solveTurnstile, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, listServers, renew, main };
+module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, solveTurnstile, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, listServers, renew, ensureServerRunning, main };
