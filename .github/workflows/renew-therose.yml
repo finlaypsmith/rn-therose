@@ -27,7 +27,8 @@ jobs:
       - name: Setup Chrome & Xvfb
         run: |
           google-chrome --version || (sudo apt-get update && sudo apt-get install -y google-chrome-stable)
-          sudo apt-get install -y xvfb
+          # xdotool：过 Turnstile 时在 Xvfb 里发真实鼠标事件；x11-utils 提供 xdpyinfo 排查用
+          sudo apt-get install -y xvfb xdotool x11-utils
 
       - name: ⚙ 设置代理 (自动选择 sing-box / Xray)
         continue-on-error: false
@@ -43,7 +44,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          xvfb-run -a node renew_therose.js
+          # 屏幕必须大于 Chrome 窗口（--window-size=1280,1200），否则 xdotool 的点击
+          # 会落到屏幕外：默认的 1280x1024 会比窗口矮，验证框可能点不到。
+          xvfb-run -a -s "-screen 0 1440x1250x24" node renew_therose.js
 
       - name: Upload artifacts
         if: always()

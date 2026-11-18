@@ -1,18 +1,19 @@
 /**
  * The Rose Cloud 自动续期（puppeteer-real-browser 版）
  *
- * 过 Cloudflare Turnstile 的核心：puppeteer-real-browser 的反检测指纹足够真，
- * 让 CF 直接 invisible 放行、不弹 interactive challenge。
- * 这是 SeleniumBase + uc_gui_click_captcha（在 Xvfb 里物理坐标点 Turnstile）被判可疑、
- * 拿不到 token 的死结所在。
+ * 过 Cloudflare Turnstile 的策略（两条腿走路）：
+ *   1) 首选 puppeteer-real-browser 的反检测指纹，让 CF 直接 invisible 放行；
+ *   2) 不放行时主动点击验证框，做法参照 bothosting-rn/app.py：只点「可见」控件，
+ *      并用 xdotool 在 Xvfb 里发真实 X11 鼠标事件（CDP 合成事件容易被判可疑）。
  * 注意：puppeteer-real-browser 内置的自动求解器（turnstile:true）在本站登录页会误点
  * Sign in 按钮、导致页面反复重导航，已关闭 —— 原因见 launchRealBrowser() 的注释。
  *
  * 流程：启动过盾浏览器（挂代理）→ 出口 IP 自检 → 打开 https://therose.cloud/login →
- *   关 cookie 弹窗 → 填凭证 → 轮询 cf-turnstile-response token 非空为唯一权威信号
- *   （fail-closed，无 token 不点 Sign in）→ 点 Sign in → 等跳转 /dashboard 并写入
- *   localStorage.trc_token → GET /api/servers → 对 suspended 或进入 30 分钟续期窗口的
- *   免费服务器 POST /api/servers/{id}/renew → 复核 expires_at → TG 通知 + 截图。
+ *   关 cookie 弹窗 → 填凭证 → 等 token（invisible 放行，必要时点击验证框；以
+ *   cf-turnstile-response token 非空为唯一权威信号，fail-closed，无 token 不点 Sign in）
+ *   → 点 Sign in → 等跳转 /dashboard 并写入 localStorage.trc_token → GET /api/servers →
+ *   对 suspended 或进入 30 分钟续期窗口的免费服务器 POST /api/servers/{id}/renew →
+ *   复核 expires_at → TG 通知 + 截图。
  *
  * 说明：旧的 client.therose.cloud 面板（cart_renew / Order now / SSO Manage server）已废弃，
  * 续期入口迁移到主站 dashboard 的 "Renew for another Xh"。主站登录是 React 受控表单
@@ -201,7 +202,9 @@ async function launchRealBrowser() {
     } catch (e) {
         throw new Error(`浏览器启动失败: ${e.message}`);
     }
-    await page.setViewport({ width: 1280, height: 1200 });
+    // 不能用 page.setViewport() 覆盖视口：Emulation 会把 innerHeight 强制成设定值，
+    // 而 xdotool 点击的屏幕坐标要靠 (outerHeight - innerHeight) 换算浏览器 UI 高度，
+    // 覆盖后该差值为 0，坐标会整体上移一个地址栏的高度。窗口尺寸由 --window-size 决定。
     return { browser, page };
 }
 
@@ -223,7 +226,7 @@ async function getTurnstileToken(page) {
     }
 }
 
-// 轮询等 Turnstile 通过：唯一权威信号 = token 非空
+// 轮询等 Turnstile 通过：唯一权威信号 = token 非空（不点击，供只读探针使用）
 async function waitTurnstileToken(page, timeoutS = 60) {
     log('📡 等待 Cloudflare Turnstile 自动放行（invisible 验证，以 token 非空为准）...');
     for (let i = 0; i < timeoutS; i++) {
@@ -236,6 +239,150 @@ async function waitTurnstileToken(page, timeoutS = 60) {
         await sleep(1500);
     }
     return false;
+}
+
+// ---- Turnstile 主动过盾：参照 bothosting-rn/app.py ----
+// CF 有时不放行 invisible 验证，需要像真人一样点一次验证框。关键点：
+//   1) 只认「可见」控件（宽 > 50、高 > 20），排除渲染完成前 0×0 的 iframe 与
+//      480×70 的整宽容器（内置求解器就是在这里点到了下方的 Sign in）；
+//   2) 点击走 X11 真实鼠标事件（xdotool），而不是 CDP Input.dispatchMouseEvent ——
+//      前者是 X server 派发的可信输入，后者容易被判为合成事件；
+//   3) 节奏：首次等 8s，之后每 10~13s 点一次，总超时 90s。
+
+let xdotoolReady = null;
+function hasXdotool() {
+    if (xdotoolReady !== null) return xdotoolReady;
+    try {
+        execFileSync('xdotool', ['help'], { stdio: 'ignore', timeout: 3000 });
+        xdotoolReady = true;
+    } catch (e) {
+        xdotoolReady = false;
+        log(`⚠️ xdotool 不可用（${e.code || e.message}），Turnstile 点击将回退 CDP`);
+    }
+    return xdotoolReady;
+}
+
+// 定位可见的 Turnstile 控件，返回页面坐标；找不到返回 null
+async function findTurnstileBox(page) {
+    return await page.evaluate(() => {
+        const visible = (r) => r.width > 50 && r.height > 20;
+        const findIn = (root) => {
+            const sel = 'iframe[src*="challenges.cloudflare.com"], [class*="turnstile"], [id*="cf-chl"]';
+            for (const el of root.querySelectorAll(sel)) {
+                const r = el.getBoundingClientRect();
+                if (visible(r)) return { x: r.left, y: r.top, w: r.width, h: r.height };
+            }
+            for (const el of root.querySelectorAll('*')) {
+                if (!el.shadowRoot) continue;
+                const hit = findIn(el.shadowRoot);
+                if (hit) return hit;
+            }
+            return null;
+        };
+        const hit = findIn(document);
+        if (hit) return hit;
+        // 兜底：从 token 隐藏域往上找一个尺寸合理的容器
+        let cur = document.querySelector('[name="cf-turnstile-response"]');
+        cur = cur ? cur.parentElement : null;
+        for (let i = 0; i < 6 && cur; i++, cur = cur.parentElement) {
+            const r = cur.getBoundingClientRect();
+            if (r.width > 100 && r.width < 600 && r.height > 30 && r.height < 140) {
+                return { x: r.left, y: r.top, w: r.width, h: r.height };
+            }
+        }
+        return null;
+    }).catch(() => null);
+}
+
+// 定位失败时输出现场快照（iframe 列表、turnstile 元素、组件状态）
+async function describeTurnstile(page) {
+    return await page.evaluate(() => {
+        const out = { rt: document.readyState, turnstile: typeof window.turnstile, iframes: [], widgets: [] };
+        for (const f of document.querySelectorAll('iframe')) {
+            const r = f.getBoundingClientRect();
+            out.iframes.push(`w=${Math.round(r.width)} h=${Math.round(r.height)} src=${(f.src || '').slice(0, 70)}`);
+        }
+        for (const el of document.querySelectorAll('[class*="turnstile"], [id*="cf-chl"], [name="cf-turnstile-response"]')) {
+            const r = el.getBoundingClientRect();
+            out.widgets.push(`${el.tagName} cls=${String(el.className || '').slice(0, 36)} w=${Math.round(r.width)} h=${Math.round(r.height)}`);
+        }
+        return out;
+    }).catch(() => null);
+}
+
+// 页面坐标 → 屏幕坐标，用 xdotool 发真实鼠标事件；xdotool 不可用时回退 CDP 点击
+async function physicalClickTurnstile(page, px, py) {
+    const geo = await page.evaluate(() => ({
+        sx: Math.round(window.screenX || 0),
+        sy: Math.round(window.screenY || 0),
+        // outerHeight 比 innerHeight 多出来的就是浏览器自身 UI（tab/地址栏）的高度
+        bar: Math.max(0, Math.round((window.outerHeight || 0) - (window.innerHeight || 0))),
+    })).catch(() => null);
+    if (!geo) return false;
+
+    const x = geo.sx + Math.round(px);
+    const y = geo.sy + Math.round(py) + geo.bar;
+    if (hasXdotool()) {
+        try {
+            execFileSync('xdotool', ['mousemove', '--sync', String(x), String(y)], { timeout: 3000, stdio: 'ignore' });
+            await sleep(150);
+            execFileSync('xdotool', ['click', '1'], { timeout: 3000, stdio: 'ignore' });
+            log(`🖱️ xdotool 点击 Turnstile 屏幕坐标 (${x}, ${y})`);
+            return true;
+        } catch (e) {
+            log(`⚠️ xdotool 点击失败: ${e.message}`);
+        }
+    }
+    try {
+        await page.mouse.click(px, py);
+        log(`🖱️ CDP 兜底点击 Turnstile (${Math.round(px)}, ${Math.round(py)})`);
+        return true;
+    } catch (e) {
+        log(`⚠️ 坐标点击失败: ${e.message}`);
+        return false;
+    }
+}
+
+// 等待 token；期间按间隔主动点击验证框（点左侧 30px，即复选框位置）
+async function solveTurnstile(page, { timeoutS = 90, firstWait = 8 } = {}) {
+    log(`🛡️ 处理 Turnstile：轮询 token，必要时点击验证框（上限 ${timeoutS}s）...`);
+    const deadline = Date.now() + timeoutS * 1000;
+    let nextClick = Date.now() + firstWait * 1000;
+    let clicks = 0;
+    let dumped = false;
+
+    while (Date.now() < deadline) {
+        const token = await getTurnstileToken(page);
+        if (token) {
+            log(`✅ Turnstile token 已就绪（长度 ${token.length}）`);
+            return true;
+        }
+        if (Date.now() >= nextClick) {
+            const box = await findTurnstileBox(page);
+            if (box) {
+                clicks++;
+                const hit = await page.evaluate((x, y) => {
+                    const el = document.elementFromPoint(x, y);
+                    return el ? `${el.tagName} ${String(el.className || '').slice(0, 28)}` : 'none';
+                }, box.x + 30, box.y + box.h / 2).catch(() => '');
+                log(`🖱️ 第 ${clicks} 次点击 Turnstile 验证框（${Math.round(box.w)}×${Math.round(box.h)}），命中 ${hit}...`);
+                await physicalClickTurnstile(page, box.x + 30, box.y + box.h / 2);
+                await sleep(3000);
+            } else {
+                if (!dumped) {
+                    dumped = true;
+                    const snap = await describeTurnstile(page);
+                    log(`🩺 暂无可点击的 Turnstile 控件: ${JSON.stringify(snap)}`);
+                }
+                if (clicks === 0) log('ℹ️ 等待 Turnstile 渲染（CF 可能仍在 invisible 校验）...');
+            }
+            nextClick = Date.now() + 10000 + Math.random() * 3000;
+        }
+        await sleep(1500);
+    }
+    const ok = !!(await getTurnstileToken(page));
+    log(`${ok ? '✅' : '❌'} Turnstile ${ok ? '已通过' : '未通过'}`);
+    return ok;
 }
 
 // 关 cookie 同意弹窗（主站是 React 渲染的 "Reject all / Accept all"）
@@ -385,18 +532,18 @@ async function login(page) {
     }
 
     let tokenOk = false;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
         // 每轮先确保凭证在（Turnstile 重新触发可能清表单）
         await fillCredentials(page);
 
-        // Turnstile 由 CF 在后台 invisible 放行，我们只轮询 token
-        if (await waitTurnstileToken(page, 60)) {
+        // 先等 CF invisible 放行；不放行则按节奏真实点击验证框
+        if (await solveTurnstile(page, { timeoutS: attempt === 1 ? 90 : 60 })) {
             tokenOk = true;
             break;
         }
         log(`⏳ 第 ${attempt} 次未拿到 token，重试...`);
         // 触发重新渲染 Turnstile：整页重开
-        if (attempt < 3) {
+        if (attempt < 2) {
             await page.evaluate(() => { try { window.location.reload(); } catch (e) {} });
             await humanWait(4, 7);
             await dismissCookieConsent(page);
@@ -660,4 +807,4 @@ if (require.main === module) {
 }
 
 // 导出各阶段函数，便于验证脚本直接跑真实流程（不改变 `node renew_therose.js` 的行为）
-module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, listServers, renew, main };
+module.exports = { launchRealBrowser, login, getTurnstileToken, waitTurnstileToken, solveTurnstile, fillCredentials, diagnosePage, probeEnvironment, probeWebRtc, listServers, renew, main };
