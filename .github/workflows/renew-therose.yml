@@ -42,8 +42,6 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          IS_PROXY: 'true'
-          PROXY_SERVER: socks5://127.0.0.1:1080
         run: |
           xvfb-run -a node renew_therose.js
 
