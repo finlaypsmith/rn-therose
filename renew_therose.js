@@ -14,8 +14,8 @@
  *   → 点 Sign in → 等跳转 /dashboard 并写入 localStorage.trc_token → GET /api/servers →
  *   对 suspended 或进入 30 分钟续期窗口的免费服务器，点击卡片上的
  *   data-testid="renew-<id>" 按钮（失败回退 POST /api/servers/{id}/renew）→
- *   进入 /server/<id> 详情页：续期按钮可点就续期，状态不是 running 就点 Start →
- *   复核 expires_at → TG 通知 + 截图。
+ *   在 dashboard 卡片上点 data-testid="start-<id>"（状态非 running 时；卡片不可用
+ *   才回退 /server/<id> 详情页）→ 复核 expires_at → TG 通知 + 截图。
  *
  * 说明：旧的 client.therose.cloud 面板（cart_renew / Order now / SSO Manage server）已废弃，
  * 续期入口迁移到主站 dashboard 的 "Renew for another Xh"。主站登录是 React 受控表单
@@ -715,8 +715,89 @@ async function clickStartButton(page, serverId) {
     }, serverId).catch(() => false);
 }
 
-// 进入详情页：续期按钮可点就续期；状态不是 running 就点启动并等它起来
-async function ensureServerRunning(page, serverId, label) {
+// dashboard 卡片上的启动按钮：[data-testid="start-<id>"]
+// 前端 disabled = powerBusy || running || installing，所以「可点」本身就意味着没在运行
+async function clickCardStart(page, serverId) {
+    const sel = `[data-testid="start-${serverId}"]`;
+    const deadline = Date.now() + 15000;
+    let last = 'missing';
+    while (Date.now() < deadline) {
+        const state = await page.evaluate((s) => {
+            const b = document.querySelector(s);
+            if (!b) return 'missing';
+            const r = b.getBoundingClientRect();
+            if (!r.width || !r.height) return 'hidden';
+            if (b.disabled) return 'disabled';
+            b.click();
+            return 'clicked';
+        }, sel).catch(() => 'error');
+        if (state === 'clicked') return true;
+        last = state;
+        if (state === 'missing') return false;
+        await sleep(500);
+    }
+    log(`⚠️ 卡片启动按钮持续不可点（${last}）`);
+    return false;
+}
+
+// 电源状态来自 GET /api/servers/{id}/resources（dashboard 卡片与详情页共用）
+async function readResourceState(page, serverId) {
+    const r = await apiFetch(page, `/servers/${serverId}/resources`);
+    if (r.status !== 200 || !r.body) return '';
+    if (r.body.installing) return 'installing';
+    return String(r.body.state || '').toLowerCase();
+}
+
+async function waitRunning(page, serverId, label, timeoutS = 90) {
+    let state = '';
+    for (let i = 0; i < timeoutS / 2; i++) {
+        await sleep(2000);
+        const s = await readResourceState(page, serverId);
+        if (s && s !== state) {
+            if (state) log(`⏳ ${label} 状态: ${s}`);
+            state = s;
+        }
+        if (s === 'running') {
+            log(`✅ ${label} 已启动`);
+            return { ok: true, state: s };
+        }
+    }
+    log(`⚠️ ${label} 启动后 ${timeoutS} 秒仍未进入 running（当前 ${state || '未知'}）`);
+    return { ok: false, state };
+}
+
+// 主路径：不离开 dashboard，直接在服务器卡片上点 Start
+async function startFromDashboard(page, serverId, label) {
+    if (!/\/dashboard/.test(page.url())) {
+        await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 })
+            .catch((e) => log(`⚠️ 返回 dashboard 失败: ${e.message}`));
+    }
+    // 等卡片与 resources 数据就绪
+    let state = '';
+    for (let i = 0; i < 10; i++) {
+        state = await readResourceState(page, serverId);
+        if (state) break;
+        await sleep(1000);
+    }
+    if (state === 'running' || state === 'starting' || state === 'installing') {
+        log(`ℹ️ ${label} 状态 ${state}，无需启动`);
+        return { ok: true, state };
+    }
+    if (!state) {
+        log(`⚠️ ${label} 读取不到电源状态，改走详情页`);
+        return { ok: false, state, fallback: true };
+    }
+
+    log(`▶️ ${label} 状态 ${state}，点击卡片上的启动按钮...`);
+    if (!(await clickCardStart(page, serverId))) {
+        log(`⚠️ ${label} 卡片上没有可点击的启动按钮，改走详情页`);
+        return { ok: false, state, fallback: true };
+    }
+    return await waitRunning(page, serverId, label);
+}
+
+// 回退路径：进入 /server/<id> 详情页，按 console 状态点启动
+async function startFromDetail(page, serverId, label) {
     log(`🔍 打开详情页: ${label}`);
     await page.goto(serverDetailUrl(serverId), { waitUntil: 'domcontentloaded', timeout: 60000 })
         .catch((e) => log(`⚠️ 打开详情页失败: ${e.message}`));
@@ -759,6 +840,13 @@ async function ensureServerRunning(page, serverId, label) {
     }
     log(`⚠️ ${label} 启动后 90 秒仍未进入 running（当前 ${state || '未知'}）`);
     return { ok: false, state };
+}
+
+// 续期后确保服务器在运行：优先 dashboard 卡片上的 Start，失败再进详情页
+async function ensureServerRunning(page, serverId, label) {
+    const onDash = await startFromDashboard(page, serverId, label);
+    if (!onDash.fallback) return onDash;
+    return await startFromDetail(page, serverId, label);
 }
 
 // 读取 dashboard 上所有续期按钮的状态：id → { visible, disabled, text }
