@@ -23,13 +23,14 @@
  */
 
 const { connect } = require('puppeteer-real-browser');
+const { execFileSync } = require('child_process');
 
 // 时区修正（必须早于浏览器启动，子进程要继承到）：
 // GitHub Actions runner 的默认时区是 UTC，而 CF 会把 UTC 视为数据中心/自动化特征，
 // 拒绝 Turnstile invisible 放行。实测本机 TZ=UTC 可稳定复现 CI 的失败（两轮均无 token），
 // 换回正常时区即 13 秒通过 —— 真人浏览器的时区几乎不会是 UTC。
-// 取与代理出口 IP（190.5.208.24，巴西 Recife）地理一致的时区。
-// 用独立的 RENEW_TZ 覆盖，不读系统 TZ：CI 上系统 TZ 恰恰就是出问题的 UTC。
+// 这里只给默认值；真正生效的时区在 launchRealBrowser() 里按出口 IP 动态解析
+// （参照 rn-dishost/app.py）：硬编码时区与出口 IP 的地理位置对不上同样是可疑信号。
 process.env.TZ = process.env.RENEW_TZ || 'America/Sao_Paulo';
 
 const EMAIL = process.env.EMAIL || '';
@@ -73,6 +74,47 @@ function humanWait(minS = 2, maxS = 4) {
     return sleep((minS + Math.random() * (maxS - minS)) * 1000);
 }
 
+// 查询出口 IP 与其时区：api.ip.sb/geoip 优先，失败降级 ip-api.com。
+// 走与浏览器相同的代理；socks5 换成 socks5h，让 DNS 也在代理端解析。
+// 用 curl 而非 fetch：Node 内置 fetch 不直接支持 socks5 代理。
+function getEgressInfo(proxyServer = '') {
+    const proxy = proxyServer ? proxyServer.replace(/^socks5:\/\//i, 'socks5h://') : '';
+    const sources = [
+        ['https://api.ip.sb/geoip', (d) => ({ ip: d.ip, tz: d.timezone })],
+        ['http://ip-api.com/json/?fields=query,timezone', (d) => ({ ip: d.query, tz: d.timezone })],
+    ];
+    for (const [url, pick] of sources) {
+        try {
+            const args = ['-sS', '--max-time', '15'];
+            if (proxy) args.push('-x', proxy);
+            args.push(url);
+            const data = JSON.parse(execFileSync('curl', args, { encoding: 'utf8', timeout: 20000 }));
+            const { ip, tz } = pick(data);
+            if (ip) return { ip, tz: tz || '' };
+        } catch (e) {
+            log(`⚠️ 获取出口信息失败（${url}）: ${String(e.message).split('\n')[0]}`);
+        }
+    }
+    return { ip: '', tz: '' };
+}
+
+// 浏览器时区与出口 IP 对齐：在 Chrome 启动前写 TZ，子进程会继承。
+// RENEW_TZ 显式指定时跳过查询（保留手动覆盖能力）。
+function applyEgressTimezone() {
+    if (process.env.RENEW_TZ) {
+        process.env.TZ = process.env.RENEW_TZ;
+        log(`🕒 使用 RENEW_TZ=${process.env.TZ}`);
+        return;
+    }
+    const { ip, tz } = getEgressInfo(IS_PROXY ? PROXY_SERVER : '');
+    if (tz) {
+        process.env.TZ = tz;
+        log(`📍 出口IP: ${ip}，时区: ${tz}（与出口一致）`);
+    } else {
+        log(`⚠️ 未获取到出口时区（出口IP: ${ip || '未知'}），沿用 ${process.env.TZ}`);
+    }
+}
+
 // 当前 GMT+8 时间字符串，与旧 Python 版 format_notification 的执行时间一致
 function nowBeijing() {
     const d = new Date();
@@ -111,6 +153,8 @@ function formatNotification(status, extra = '', error = '') {
 
 // 启动过盾浏览器（puppeteer-real-browser + turnstile:true），按 IS_PROXY 挂 socks5 代理
 async function launchRealBrowser() {
+    applyEgressTimezone();
+
     const args = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
