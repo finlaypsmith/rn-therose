@@ -160,10 +160,9 @@ async function sendTelegram(message) {
 
 // 出口 IP 与时区单独一行展示（时区取 applyEgressTimezone 解析结果）
 function egressLine(ip) {
-    const parts = [];
-    if (ip) parts.push(`🌐 出口IP: ${ip}`);
-    if (egressTimezone) parts.push(`🕒 时区: ${egressTimezone}`);
-    return parts.join(' · ');
+    if (!ip && !egressTimezone) return '';
+    const tz = egressTimezone ? ` (${egressTimezone})` : '';
+    return `🌍 出口IP: ${ip || '未知'}${tz}`;
 }
 
 // 与旧 Python 版 format_notification 逐行一致的通知文案
