@@ -653,25 +653,27 @@ function fmtTime(ms) {
 }
 
 // 点击 dashboard 卡片上的续期按钮：<button data-testid="renew-<serverId>">
-// 返回 { ok, detail }。按钮未出现/被禁用时返回 ok=false，由调用方决定回退 API。
+// 返回 { ok, detail }。串行续期时前端的 renewBusy 会把所有按钮置为 disabled，
+// 这里先等它恢复（最多 15s），仍不可用才交给调用方回退 API。
 async function clickRenewButton(page, serverId) {
     const sel = `[data-testid="renew-${serverId}"]`;
-    const deadline = Date.now() + 10000;
+    const deadline = Date.now() + 15000;
+    let last = 'missing';
     while (Date.now() < deadline) {
         const state = await page.evaluate((s) => {
             const b = document.querySelector(s);
             if (!b) return 'missing';
             const r = b.getBoundingClientRect();
             if (r.width < 2 || r.height < 2) return 'hidden';
-            if (b.disabled) return 'disabled';
+            if (b.disabled) return `disabled:${(b.textContent || '').trim().slice(0, 20)}`;
             b.click();
             return 'clicked';
         }, sel).catch(() => 'error');
         if (state === 'clicked') return { ok: true, detail: '' };
-        if (state === 'disabled') return { ok: false, detail: '按钮处于 disabled（可能已在处理中）' };
+        last = state;
         await sleep(500);
     }
-    return { ok: false, detail: '未找到可点击的续期按钮' };
+    return { ok: false, detail: last === 'missing' || last === 'hidden' ? '未找到可点击的续期按钮' : `按钮持续不可点（${last}）` };
 }
 
 const serverDetailUrl = (id) => `${SITE_URL}/server/${id}`;
@@ -759,6 +761,26 @@ async function ensureServerRunning(page, serverId, label) {
     return { ok: false, state };
 }
 
+// 读取 dashboard 上所有续期按钮的状态：id → { visible, disabled, text }
+// 前端的可续期判定是 R = suspended || expires_at - now <= windowMs，文案随之变化：
+//   suspended → "Renew and restore…"，到期前窗口内 → "Renew for another…"，
+//   窗口外 → "Renewable in …"（disabled）。直接看按钮是否可点最可靠。
+async function collectRenewButtons(page) {
+    return await page.evaluate(() => {
+        const out = {};
+        for (const b of document.querySelectorAll('[data-testid^="renew-"]')) {
+            const id = (b.getAttribute('data-testid') || '').slice('renew-'.length);
+            const r = b.getBoundingClientRect();
+            out[id] = {
+                visible: !!(r.width && r.height),
+                disabled: !!b.disabled,
+                text: (b.textContent || '').trim().replace(/\s+/g, ' '),
+            };
+        }
+        return out;
+    }).catch(() => ({}));
+}
+
 // 续期：主站 dashboard 的 "↻ Renew and restore for another 12 hours"。优先点击真实按钮，
 // 按钮不可用时回退到按钮背后的同名接口 POST /api/servers/{id}/renew。
 // 判定与前端一致：免费服务器处于 suspended，或距离 expires_at 不足续期窗口。
@@ -770,12 +792,29 @@ async function renew(page) {
     const windowMinutes = await fetchRenewWindowMinutes(page);
     const windowMs = windowMinutes * 60 * 1000;
     const servers = await listServers(page);
-    // 与前端 m 列表同款过滤：排除 cancelled，以及 expired 且没有面板 ID（已彻底释放）的
-    const free = servers.filter((s) => s.is_free && s.status !== 'cancelled' && !(s.status === 'expired' && !s.pterodactyl_server_id));
+    // 与前端 m 列表 + 按钮渲染条件对齐：排除 cancelled、expired 且无面板 ID（已终止），
+    // 以及 shared（别人共享给你的免费服务器，前端不渲染续期按钮）
+    const free = servers.filter((s) => s.is_free && !s.shared
+        && s.status !== 'cancelled' && !(s.status === 'expired' && !s.pterodactyl_server_id));
     log(`📋 服务器 ${servers.length} 台（免费 ${free.length} 台），续期窗口 ${windowMinutes} 分钟`);
+
+    // 等卡片渲染出续期按钮（数据是异步拉的）
+    let buttons = {};
+    for (let i = 0; i < 15; i++) {
+        buttons = await collectRenewButtons(page);
+        if (Object.keys(buttons).length) break;
+        await sleep(1000);
+    }
+    for (const s of free) {
+        const b = buttons[s.id];
+        if (b) log(`🔘 ${serverLabel(s)}: ${b.disabled ? '不可点' : '可点'}｜${b.text}`);
+    }
 
     const now = Date.now();
     const eligible = free.filter((s) => {
+        const b = buttons[s.id];
+        // 按钮可点 = 前端的 R && !renewBusy，以此为准（覆盖到期前窗口内与已过期两种情况）
+        if (b && b.visible && !b.disabled) return true;
         const exp = expiresAtMs(s);
         return s.status === 'suspended' || (exp > 0 && exp - now <= windowMs);
     });
